@@ -277,6 +277,47 @@ async def unbind_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     )
 
 
+async def resume_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """LOCAL PATCH: rebind this topic to an earlier session in ccbot's cwd.
+
+    Binding a topic no longer offers a session picker, so this is the way back
+    to an earlier conversation. The topic's current window is killed first so
+    resuming doesn't leave an orphan behind.
+    """
+    user = update.effective_user
+    if not user or not is_user_allowed(user.id):
+        return
+    if not update.message:
+        return
+
+    thread_id = _get_thread_id(update)
+    if thread_id is None:
+        await safe_reply(update.message, "❌ This command only works in a topic.")
+        return
+
+    start_path = str(Path.cwd())
+    sessions = await session_manager.list_sessions_for_directory(start_path)
+    if not sessions:
+        await safe_reply(update.message, f"❌ No sessions found in {start_path}.")
+        return
+
+    wid = session_manager.get_window_for_thread(user.id, thread_id)
+    if wid:
+        session_manager.unbind_thread(user.id, thread_id)
+        await clear_topic_state(user.id, thread_id, context.bot, context.user_data)
+        await tmux_manager.kill_window(wid)
+
+    if context.user_data is not None:
+        context.user_data[STATE_KEY] = STATE_SELECTING_SESSION
+        context.user_data[SESSIONS_KEY] = sessions
+        context.user_data["_selected_path"] = start_path
+        context.user_data["_pending_thread_id"] = thread_id
+        context.user_data.pop("_pending_thread_text", None)
+
+    text, keyboard = build_session_picker(sessions)
+    await safe_reply(update.message, text, reply_markup=keyboard)
+
+
 async def esc_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Send Escape key to interrupt Claude."""
     user = update.effective_user
@@ -1926,6 +1967,7 @@ def create_bot() -> Application:
     application.add_handler(CommandHandler("history", history_command))
     application.add_handler(CommandHandler("screenshot", screenshot_command))
     application.add_handler(CommandHandler("esc", esc_command))
+    application.add_handler(CommandHandler("resume", resume_command))
     application.add_handler(CommandHandler("unbind", unbind_command))
     application.add_handler(CommandHandler("usage", usage_command))
     application.add_handler(CallbackQueryHandler(callback_handler))

@@ -748,7 +748,10 @@ class SessionManager:
             return None
 
         if not summary:
-            summary = last_user_msg[:50] if last_user_msg else "Untitled"
+            # LOCAL PATCH: the fallback is the last user message, which on a
+            # Telegram-bridged session is wrapped in <channel …> markup.
+            cleaned = " ".join(re.sub(r"<[^>]+>", " ", last_user_msg).split())
+            summary = cleaned[:50] if cleaned else "Untitled"
 
         return ClaudeSession(
             session_id=session_id,
