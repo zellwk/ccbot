@@ -920,22 +920,28 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             await safe_reply(update.message, msg_text, reply_markup=keyboard)
             return
 
-        # No unbound windows — show directory browser to create a new session
+        # LOCAL PATCH: no directory browser, no resume picker. An unbound
+        # topic starts a fresh session in ccbot's own cwd. Upstream paginates a
+        # directory browser, then offers a picker whose labels are each
+        # session's first user message — unreadable for bridge sessions.
+        start_path = str(Path.cwd())
         logger.info(
-            "Unbound topic: showing directory browser (user=%d, thread=%d)",
+            "Unbound topic: auto-creating session at %s (user=%d, thread=%d)",
+            start_path,
             user.id,
             thread_id,
         )
-        start_path = str(Path.cwd())
-        msg_text, keyboard, subdirs = build_directory_browser(start_path)
         if context.user_data is not None:
-            context.user_data[STATE_KEY] = STATE_BROWSING_DIRECTORY
-            context.user_data[BROWSE_PATH_KEY] = start_path
-            context.user_data[BROWSE_PAGE_KEY] = 0
-            context.user_data[BROWSE_DIRS_KEY] = subdirs
             context.user_data["_pending_thread_id"] = thread_id
             context.user_data["_pending_thread_text"] = text
-        await safe_reply(update.message, msg_text, reply_markup=keyboard)
+        await _create_and_bind_window(
+            None,
+            context,
+            user,
+            start_path,
+            thread_id,
+            origin_message=update.message,
+        )
         return
 
     # Bound topic — forward to bound window
@@ -1018,12 +1024,13 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 async def _create_and_bind_window(
-    query: object,
+    query: object | None,
     context: ContextTypes.DEFAULT_TYPE,
     user: object,
     selected_path: str,
     pending_thread_id: int | None,
     resume_session_id: str | None = None,
+    origin_message: object | None = None,
 ) -> None:
     """Create a tmux window, bind it to a topic, and forward pending text.
 
@@ -1031,8 +1038,15 @@ async def _create_and_bind_window(
     """
     from telegram import CallbackQuery, User
 
-    assert isinstance(query, CallbackQuery)
+    assert query is None or isinstance(query, CallbackQuery)
     assert isinstance(user, User)
+
+    async def _notify(text: str) -> None:
+        """Edit the callback message, or reply to the originating message."""
+        if query is not None:
+            await safe_edit(query, text)
+        elif origin_message is not None:
+            await safe_reply(origin_message, text)
 
     success, message, created_wname, created_wid = await tmux_manager.create_window(
         selected_path, resume_session_id=resume_session_id
@@ -1099,10 +1113,7 @@ async def _create_and_bind_window(
             )
 
             status = "Resumed" if resume_session_id else "Created"
-            await safe_edit(
-                query,
-                f"✅ {message}\n\n{status}. Send messages here.",
-            )
+            await _notify(f"✅ {message}\n\n{status}. Send messages here.")
 
             # Send pending text if any
             pending_text = (
@@ -1138,13 +1149,14 @@ async def _create_and_bind_window(
                 context.user_data.pop("_pending_thread_id", None)
         else:
             # Should not happen in topic-only mode, but handle gracefully
-            await safe_edit(query, f"✅ {message}")
+            await _notify(f"✅ {message}")
     else:
-        await safe_edit(query, f"❌ {message}")
+        await _notify(f"❌ {message}")
         if pending_thread_id is not None and context.user_data is not None:
             context.user_data.pop("_pending_thread_id", None)
             context.user_data.pop("_pending_thread_text", None)
-    await query.answer("Created" if success else "Failed")
+    if query is not None:
+        await query.answer("Created" if success else "Failed")
 
 
 # --- Callback query handler ---
