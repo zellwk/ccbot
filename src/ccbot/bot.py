@@ -1893,6 +1893,7 @@ async def post_init(application: Application) -> None:
         BotCommand("esc", "Send Escape to interrupt Claude"),
         BotCommand("kill", "Kill session and delete topic"),
         BotCommand("unbind", "Unbind topic from session (keeps window running)"),
+        BotCommand("resume", "Rebind this topic to an earlier session"),
         BotCommand("usage", "Show Claude Code usage remaining"),
     ]
     # Add Claude Code slash commands
