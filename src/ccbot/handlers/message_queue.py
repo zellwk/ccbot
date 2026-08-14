@@ -78,6 +78,12 @@ _tool_msg_ids: dict[tuple[str, int, int], int] = {}
 # Status message tracking: (user_id, thread_id_or_0) -> (message_id, window_id, last_text)
 _status_msg_info: dict[tuple[int, int], tuple[int, str, str]] = {}
 
+# Typing keepalive tasks: (user_id, thread_id_or_0) -> repeating chat-action task
+_typing_tasks: dict[tuple[int, int], asyncio.Task[None]] = {}
+
+# Telegram clears a chat action after ~5s, so refresh just under that.
+TYPING_REFRESH_INTERVAL = 4.0
+
 # Flood control: user_id -> monotonic time when ban expires
 _flood_until: dict[int, float] = {}
 
@@ -484,6 +490,33 @@ async def _convert_status_to_content(
             return None
 
 
+def _sync_typing(bot: Bot, chat_id: int, skey: tuple[int, int], text: str) -> None:
+    """Light or clear the typing indicator to match what the status line reports.
+
+    Telegram expires a chat action after ~5s, so a working session needs it
+    re-sent on a timer rather than once per status change.
+    """
+    if "esc to interrupt" in text.lower():
+        if skey not in _typing_tasks:
+            _typing_tasks[skey] = asyncio.create_task(_typing_keepalive(bot, chat_id))
+        return
+    task = _typing_tasks.pop(skey, None)
+    if task:
+        task.cancel()
+
+
+async def _typing_keepalive(bot: Bot, chat_id: int) -> None:
+    """Re-send the typing chat action until cancelled."""
+    while True:
+        try:
+            await bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            pass
+        await asyncio.sleep(TYPING_REFRESH_INTERVAL)
+
+
 async def _process_status_update_task(
     bot: Bot, user_id: int, task: MessageTask
 ) -> None:
@@ -499,6 +532,8 @@ async def _process_status_update_task(
         await _do_clear_status_message(bot, user_id, tid)
         return
 
+    _sync_typing(bot, chat_id, skey, status_text)
+
     current_info = _status_msg_info.get(skey)
 
     if current_info:
@@ -513,16 +548,6 @@ async def _process_status_update_task(
             return
         else:
             # Same window, text changed - edit in place
-            # Send typing indicator when Claude is working
-            if "esc to interrupt" in status_text.lower():
-                try:
-                    await bot.send_chat_action(
-                        chat_id=chat_id, action=ChatAction.TYPING
-                    )
-                except RetryAfter:
-                    raise
-                except Exception:
-                    pass
             try:
                 await bot.edit_message_text(
                     chat_id=chat_id,
@@ -573,14 +598,7 @@ async def _do_send_status_message(
             await bot.delete_message(chat_id=chat_id, message_id=old[0])
         except Exception:
             pass
-    # Send typing indicator when Claude is working
-    if "esc to interrupt" in text.lower():
-        try:
-            await bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
-        except RetryAfter:
-            raise
-        except Exception:
-            pass
+    _sync_typing(bot, chat_id, skey, text)
     sent = await send_with_fallback(
         bot,
         chat_id,
@@ -598,6 +616,7 @@ async def _do_clear_status_message(
 ) -> None:
     """Delete the status message for a user (internal, called from worker)."""
     skey = (user_id, thread_id_or_0)
+    _sync_typing(bot, 0, skey, "")
     info = _status_msg_info.pop(skey, None)
     if info:
         msg_id = info[0]
@@ -707,6 +726,9 @@ def clear_status_msg_info(user_id: int, thread_id: int | None = None) -> None:
     """Clear status message tracking for a user (and optionally a specific thread)."""
     skey = (user_id, thread_id or 0)
     _status_msg_info.pop(skey, None)
+    typing = _typing_tasks.pop(skey, None)
+    if typing:
+        typing.cancel()
 
 
 def clear_tool_msg_ids_for_topic(user_id: int, thread_id: int | None = None) -> None:
@@ -725,6 +747,9 @@ def clear_tool_msg_ids_for_topic(user_id: int, thread_id: int | None = None) -> 
 
 async def shutdown_workers() -> None:
     """Stop all queue workers (called during bot shutdown)."""
+    for _, typing in list(_typing_tasks.items()):
+        typing.cancel()
+    _typing_tasks.clear()
     for _, worker in list(_queue_workers.items()):
         worker.cancel()
         try:
