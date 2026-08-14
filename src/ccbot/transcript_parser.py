@@ -638,6 +638,7 @@ class TranscriptParser:
                                     text=entry_text,
                                     content_type="tool_result",
                                     tool_use_id=_tuid,
+                                    tool_name=tool_name,
                                     timestamp=entry_timestamp,
                                 )
                             )
@@ -667,6 +668,7 @@ class TranscriptParser:
                                     text=entry_text,
                                     content_type="tool_result",
                                     tool_use_id=_tuid,
+                                    tool_name=tool_name,
                                     timestamp=entry_timestamp,
                                     image_data=result_images,
                                 )
@@ -713,6 +715,7 @@ class TranscriptParser:
                                     text=entry_text,
                                     content_type="tool_result",
                                     tool_use_id=_tuid,
+                                    tool_name=tool_name,
                                     timestamp=entry_timestamp,
                                     image_data=result_images,
                                 )
@@ -728,6 +731,7 @@ class TranscriptParser:
                                     else (tool_summary or ""),
                                     content_type="tool_result",
                                     tool_use_id=_tuid,
+                                    tool_name=tool_name,
                                     timestamp=entry_timestamp,
                                     image_data=result_images,
                                 )

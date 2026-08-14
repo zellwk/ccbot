@@ -96,6 +96,14 @@ class Config:
             os.getenv("CCBOT_SHOW_TOOL_CALLS", "true").lower() != "false"
         )
 
+        # Restrict tool call notifications to these tool names (comma-separated).
+        # Empty means every tool is shown.
+        self.tool_call_allowlist = {
+            name.strip()
+            for name in os.getenv("CCBOT_TOOL_CALL_ALLOWLIST", "").split(",")
+            if name.strip()
+        }
+
         # Show hidden (dot) directories in directory browser
         self.show_hidden_dirs = (
             os.getenv("CCBOT_SHOW_HIDDEN_DIRS", "").lower() == "true"

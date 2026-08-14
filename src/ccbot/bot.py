@@ -1837,12 +1837,14 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
         if get_interactive_msg_id(user_id, thread_id):
             await clear_interactive_msg(user_id, bot, thread_id)
 
-        # Skip tool call notifications when CCBOT_SHOW_TOOL_CALLS=false
-        if not config.show_tool_calls and msg.content_type in (
-            "tool_use",
-            "tool_result",
-        ):
-            continue
+        # Skip tool call notifications turned off by CCBOT_SHOW_TOOL_CALLS,
+        # or left out of CCBOT_TOOL_CALL_ALLOWLIST.
+        if msg.content_type in ("tool_use", "tool_result"):
+            if not config.show_tool_calls:
+                continue
+            allowlist = config.tool_call_allowlist
+            if allowlist and msg.tool_name not in allowlist:
+                continue
 
         parts = build_response_parts(
             msg.text,
