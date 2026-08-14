@@ -131,6 +131,7 @@ from .handlers.response_builder import build_response_parts
 from .handlers.status_polling import status_poll_loop
 from .screenshot import text_to_image
 from .session import session_manager
+from .token_usage import read_usage
 from .session_monitor import NewMessage, SessionMonitor
 from .terminal_parser import extract_bash_output, is_interactive_ui
 from .tmux_manager import tmux_manager
@@ -388,6 +389,40 @@ async def usage_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         if len(trimmed) > 3000:
             trimmed = trimmed[:3000] + "\n... (truncated)"
         await safe_reply(update.message, f"```\n{trimmed}\n```")
+
+
+async def tokens_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Report this topic's token usage, read from the session transcript.
+
+    Unlike /usage this never touches the TUI, so it costs no Claude tokens and
+    can't queue keystrokes into a session that is mid-turn.
+    """
+    user = update.effective_user
+    if not user or not is_user_allowed(user.id):
+        return
+    if not update.message:
+        return
+
+    thread_id = _get_thread_id(update)
+    wid = session_manager.resolve_window_for_thread(user.id, thread_id)
+    if not wid:
+        await safe_reply(update.message, "No session bound to this topic.")
+        return
+
+    session_id = session_manager.get_window_state(wid).session_id
+    usage = await asyncio.to_thread(read_usage, session_id)
+    if not usage:
+        await safe_reply(update.message, "No transcript on disk for this session yet.")
+        return
+
+    lines = [
+        f"context       {usage['context']:>9,}",
+        f"output total  {usage['output_total']:>9,}",
+        f"turns         {usage['turns']:>9,}",
+    ]
+    if usage["compactions"]:
+        lines.append(f"compactions   {usage['compactions']:>9,}")
+    await safe_reply(update.message, "```\n" + "\n".join(lines) + "\n```")
 
 
 # --- Screenshot keyboard with quick control keys ---
@@ -1899,6 +1934,7 @@ async def post_init(application: Application) -> None:
         BotCommand("unbind", "Unbind topic from session (keeps window running)"),
         BotCommand("resume", "Rebind this topic to an earlier session"),
         BotCommand("usage", "Show Claude Code usage remaining"),
+        BotCommand("tokens", "Token usage for this topic's session"),
     ]
     # Add Claude Code slash commands
     for cmd_name, desc in CC_COMMANDS.items():
@@ -1975,6 +2011,7 @@ def create_bot() -> Application:
     application.add_handler(CommandHandler("resume", resume_command))
     application.add_handler(CommandHandler("unbind", unbind_command))
     application.add_handler(CommandHandler("usage", usage_command))
+    application.add_handler(CommandHandler("tokens", tokens_command))
     application.add_handler(CallbackQueryHandler(callback_handler))
     # Topic closed event — auto-kill associated window
     application.add_handler(
