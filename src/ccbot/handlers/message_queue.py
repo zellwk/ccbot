@@ -490,30 +490,39 @@ async def _convert_status_to_content(
             return None
 
 
-def _sync_typing(bot: Bot, chat_id: int, skey: tuple[int, int], text: str) -> None:
-    """Light or clear the typing indicator to match what the status line reports.
+def set_typing(bot: Bot, user_id: int, thread_id: int | None, active: bool) -> None:
+    """Light or clear the typing indicator for a session.
 
-    Telegram expires a chat action after ~5s, so a working session needs it
-    re-sent on a timer rather than once per status change.
+    Status polling is the single caller that knows whether Claude is working,
+    so it drives this. Telegram expires a chat action after ~5s, so an active
+    session needs it re-sent on a timer rather than once per state change.
     """
-    if "esc to interrupt" in text.lower():
+    skey = (user_id, thread_id or 0)
+    if active:
         if skey not in _typing_tasks:
-            _typing_tasks[skey] = asyncio.create_task(_typing_keepalive(bot, chat_id))
+            chat_id = session_manager.resolve_chat_id(user_id, thread_id)
+            _typing_tasks[skey] = asyncio.create_task(
+                _typing_keepalive(bot, chat_id, thread_id)
+            )
         return
     task = _typing_tasks.pop(skey, None)
     if task:
         task.cancel()
 
 
-async def _typing_keepalive(bot: Bot, chat_id: int) -> None:
+async def _typing_keepalive(bot: Bot, chat_id: int, thread_id: int | None) -> None:
     """Re-send the typing chat action until cancelled."""
     while True:
         try:
-            await bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+            await bot.send_chat_action(
+                chat_id=chat_id,
+                action=ChatAction.TYPING,
+                **_send_kwargs(thread_id),  # type: ignore[arg-type]
+            )
         except asyncio.CancelledError:
             raise
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"typing keepalive failed for chat {chat_id}: {e}")
         await asyncio.sleep(TYPING_REFRESH_INTERVAL)
 
 
@@ -531,8 +540,6 @@ async def _process_status_update_task(
         # No status text means clear status
         await _do_clear_status_message(bot, user_id, tid)
         return
-
-    _sync_typing(bot, chat_id, skey, status_text)
 
     current_info = _status_msg_info.get(skey)
 
@@ -598,7 +605,6 @@ async def _do_send_status_message(
             await bot.delete_message(chat_id=chat_id, message_id=old[0])
         except Exception:
             pass
-    _sync_typing(bot, chat_id, skey, text)
     sent = await send_with_fallback(
         bot,
         chat_id,
@@ -616,7 +622,7 @@ async def _do_clear_status_message(
 ) -> None:
     """Delete the status message for a user (internal, called from worker)."""
     skey = (user_id, thread_id_or_0)
-    _sync_typing(bot, 0, skey, "")
+    set_typing(bot, user_id, thread_id_or_0 or None, False)
     info = _status_msg_info.pop(skey, None)
     if info:
         msg_id = info[0]
