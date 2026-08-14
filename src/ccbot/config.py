@@ -115,6 +115,25 @@ class Config:
             os.getenv("CCBOT_SHOW_HIDDEN_DIRS", "").lower() == "true"
         )
 
+        # Auto-name a topic after this many user turns. 0 disables it.
+        self.autoname_after_turns = int(os.getenv("CCBOT_AUTONAME_AFTER", "3"))
+
+        # Local Ollama model that writes the title — no Claude tokens spent.
+        self.autoname_model = os.getenv("CCBOT_AUTONAME_MODEL", "gemma3:4b")
+        self.autoname_ollama_url = os.getenv(
+            "CCBOT_OLLAMA_URL", "http://localhost:11434"
+        ).rstrip("/")
+
+        # Topic names that count as "not named yet". Renaming a topic back to
+        # one of these re-arms auto-naming for that thread.
+        self.autoname_placeholders = {
+            name.strip().lower()
+            for name in os.getenv(
+                "CCBOT_AUTONAME_PLACEHOLDERS", "new chat,new topic,untitled"
+            ).split(",")
+            if name.strip()
+        }
+
         # OpenAI API for voice message transcription (optional)
         self.openai_api_key: str = os.getenv("OPENAI_API_KEY", "")
         self.openai_base_url: str = os.getenv(

@@ -132,6 +132,7 @@ from .handlers.status_polling import status_poll_loop
 from .screenshot import text_to_image
 from .session import session_manager
 from .token_usage import read_usage
+from .topic_namer import is_placeholder, maybe_autoname
 from .session_monitor import NewMessage, SessionMonitor
 from .terminal_parser import extract_bash_output, is_interactive_ui
 from .tmux_manager import tmux_manager
@@ -549,6 +550,9 @@ async def topic_edited_handler(
     old_name = session_manager.get_display_name(wid)
     await tmux_manager.rename_window(wid, new_name)
     session_manager.update_display_name(wid, new_name)
+    # A name Zell picked is final — unless he picks a placeholder, which asks
+    # for a fresh auto-name after the next message.
+    session_manager.mark_auto_named(wid, not is_placeholder(new_name))
     logger.info(
         "Topic renamed: '%s' -> '%s' (window=%s, user=%d, thread=%d)",
         old_name,
@@ -1082,6 +1086,9 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if not success:
         await safe_reply(update.message, f"❌ {message}")
         return
+
+    # Name the topic once the thread has enough turns to have a direction
+    asyncio.create_task(maybe_autoname(context.bot, user.id, thread_id, wid))
 
     # Start background capture for ! bash command output
     if text.startswith("!") and len(text) > 1:

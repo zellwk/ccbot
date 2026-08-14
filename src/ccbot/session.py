@@ -49,11 +49,13 @@ class WindowState:
         session_id: Associated Claude session ID (empty if not yet detected)
         cwd: Working directory for direct file path construction
         window_name: Display name of the window
+        auto_named: Topic has a real name — skip auto-naming from now on
     """
 
     session_id: str = ""
     cwd: str = ""
     window_name: str = ""
+    auto_named: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {
@@ -62,6 +64,8 @@ class WindowState:
         }
         if self.window_name:
             d["window_name"] = self.window_name
+        if self.auto_named:
+            d["auto_named"] = True
         return d
 
     @classmethod
@@ -70,6 +74,7 @@ class WindowState:
             session_id=data.get("session_id", ""),
             cwd=data.get("cwd", ""),
             window_name=data.get("window_name", ""),
+            auto_named=bool(data.get("auto_named", False)),
         )
 
 
@@ -679,6 +684,14 @@ class SessionManager:
         if window_id not in self.window_states:
             self.window_states[window_id] = WindowState()
         return self.window_states[window_id]
+
+    def mark_auto_named(self, window_id: str, value: bool) -> None:
+        """Set whether this window's topic already carries a real name."""
+        state = self.get_window_state(window_id)
+        if state.auto_named == value:
+            return
+        state.auto_named = value
+        self._save_state()
 
     def clear_window_session(self, window_id: str) -> None:
         """Clear session association for a window (e.g., after /clear command)."""
