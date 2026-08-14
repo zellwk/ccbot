@@ -41,6 +41,9 @@ from pathlib import Path
 from telegram import (
     Bot,
     BotCommand,
+    BotCommandScopeAllChatAdministrators,
+    BotCommandScopeAllGroupChats,
+    BotCommandScopeAllPrivateChats,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     InputMediaDocument,
@@ -606,7 +609,6 @@ async def forward_command_handler(
         logger.warning("send_action(TYPING) failed, continuing to injection: %s", e)
     success, message = await session_manager.send_to_window(wid, cc_slash)
     if success:
-        await safe_reply(update.message, f"⚡ [{display}] Sent: {cc_slash}")
         # If /clear command was sent, clear the session association
         # so we can detect the new session after first message
         if cc_slash.strip().lower() == "/clear":
@@ -1930,14 +1932,25 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
 async def post_init(application: Application) -> None:
     global session_monitor, _status_poll_task
 
-    await application.bot.delete_my_commands()
+    # Clear every scope we might have written before, plus stale scopes left by
+    # earlier setups (BotFather, older versions).  A narrower scope beats the
+    # default scope, so a stale all_private_chats list hides the real menu.
+    for scope in (
+        None,
+        BotCommandScopeAllPrivateChats(),
+        BotCommandScopeAllGroupChats(),
+        BotCommandScopeAllChatAdministrators(),
+    ):
+        try:
+            await application.bot.delete_my_commands(scope=scope)
+        except Exception as e:
+            logger.warning("delete_my_commands(%s) failed: %s", scope, e)
 
     bot_commands = [
         BotCommand("start", "Show welcome message"),
         BotCommand("history", "Message history for this topic"),
         BotCommand("screenshot", "Terminal screenshot with control keys"),
         BotCommand("esc", "Send Escape to interrupt Claude"),
-        BotCommand("kill", "Kill session and delete topic"),
         BotCommand("unbind", "Unbind topic from session (keeps window running)"),
         BotCommand("resume", "Rebind this topic to an earlier session"),
         BotCommand("usage", "Show Claude Code usage remaining"),
@@ -1947,7 +1960,18 @@ async def post_init(application: Application) -> None:
     for cmd_name, desc in CC_COMMANDS.items():
         bot_commands.append(BotCommand(cmd_name, desc))
 
-    await application.bot.set_my_commands(bot_commands)
+    # Register on every scope Zell chats in.  Clients read the scope that matches
+    # the chat, so forum topics need all_group_chats set explicitly — falling
+    # back to default is unreliable for the composer's "/" button.
+    for scope in (
+        None,
+        BotCommandScopeAllPrivateChats(),
+        BotCommandScopeAllGroupChats(),
+    ):
+        try:
+            await application.bot.set_my_commands(bot_commands, scope=scope)
+        except Exception as e:
+            logger.warning("set_my_commands(%s) failed: %s", scope, e)
 
     # Re-resolve stale window IDs from persisted state against live tmux windows
     await session_manager.resolve_stale_ids()
