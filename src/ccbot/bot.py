@@ -674,8 +674,10 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await safe_reply(update.message, f"❌ {message}")
         return
 
-    # Confirm to user
-    await safe_reply(update.message, "📷 Image sent to Claude Code.")
+    # Confirm to user — same switch as the user-message echo, since this is
+    # only a restatement of what they just did. Failures above still report.
+    if config.show_user_messages:
+        await safe_reply(update.message, "📷 Image sent to Claude Code.")
 
 
 async def voice_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
