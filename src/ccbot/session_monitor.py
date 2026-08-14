@@ -363,6 +363,9 @@ class SessionMonitor:
                     # Skip user messages unless show_user_messages is enabled
                     if entry.role == "user" and not config.show_user_messages:
                         continue
+                    # Skip thinking blocks unless show_thinking is enabled
+                    if entry.content_type == "thinking" and not config.show_thinking:
+                        continue
                     new_messages.append(
                         NewMessage(
                             session_id=session_info.session_id,

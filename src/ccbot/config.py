@@ -96,6 +96,12 @@ class Config:
             os.getenv("CCBOT_SHOW_TOOL_CALLS", "true").lower() != "false"
         )
 
+        # Send Claude's thinking blocks to Telegram as messages.
+        # When False the live status message is the only "working" signal.
+        self.show_thinking = (
+            os.getenv("CCBOT_SHOW_THINKING", "true").lower() != "false"
+        )
+
         # Restrict tool call notifications to these tool names (comma-separated).
         # Empty means every tool is shown.
         self.tool_call_allowlist = {
