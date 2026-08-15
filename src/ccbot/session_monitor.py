@@ -77,6 +77,7 @@ class SessionMonitor:
         self._running = False
         self._task: asyncio.Task | None = None
         self._message_callback: Callable[[NewMessage], Awaitable[None]] | None = None
+        self._agent_change_callback: Callable[[str], Awaitable[None]] | None = None
         # Per-session pending tool_use state carried across poll cycles
         self._pending_tools: dict[str, dict[str, Any]] = {}  # session_id -> pending
         # Track last known session_map for detecting changes
@@ -89,6 +90,12 @@ class SessionMonitor:
         self, callback: Callable[[NewMessage], Awaitable[None]]
     ) -> None:
         self._message_callback = callback
+
+    def set_agent_change_callback(
+        self, callback: Callable[[str], Awaitable[None]]
+    ) -> None:
+        """Register a callback fired with the window_id whose session was replaced."""
+        self._agent_change_callback = callback
 
     async def _get_active_cwds(self) -> set[str]:
         """Get normalized cwds of all active tmux windows."""
@@ -434,14 +441,16 @@ class SessionMonitor:
                 self._file_mtimes.pop(session_id, None)
             self.state.save_if_dirty()
 
-    async def _detect_and_cleanup_changes(self) -> dict[str, str]:
+    async def _detect_and_cleanup_changes(self) -> tuple[dict[str, str], list[str]]:
         """Detect session_map changes and cleanup replaced/removed sessions.
 
-        Returns current session_map for further processing.
+        Returns the current session_map plus the window ids whose session was
+        replaced — a respawn under a different agent looks exactly like this.
         """
         current_map = await self._load_current_session_map()
 
         sessions_to_remove: set[str] = set()
+        replaced_windows: list[str] = []
 
         # Check for window session changes (window exists in both, but session_id changed)
         for window_id, old_session_id in self._last_session_map.items():
@@ -454,6 +463,7 @@ class SessionMonitor:
                     new_session_id,
                 )
                 sessions_to_remove.add(old_session_id)
+                replaced_windows.append(window_id)
 
         # Check for deleted windows (window in old map but not in current)
         old_windows = set(self._last_session_map.keys())
@@ -479,7 +489,7 @@ class SessionMonitor:
         # Update last known map
         self._last_session_map = current_map
 
-        return current_map
+        return current_map, replaced_windows
 
     async def _monitor_loop(self) -> None:
         """Background loop for checking session updates.
@@ -502,8 +512,15 @@ class SessionMonitor:
                 await session_manager.load_session_map()
 
                 # Detect session_map changes and cleanup replaced/removed sessions
-                current_map = await self._detect_and_cleanup_changes()
+                current_map, replaced_windows = await self._detect_and_cleanup_changes()
                 active_session_ids = set(current_map.values())
+
+                if self._agent_change_callback:
+                    for window_id in replaced_windows:
+                        try:
+                            await self._agent_change_callback(window_id)
+                        except Exception as e:
+                            logger.error(f"Agent change callback error: {e}")
 
                 # Check for new messages (all I/O is async)
                 new_messages = await self.check_for_updates(active_session_ids)

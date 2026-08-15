@@ -60,6 +60,7 @@ from telegram.ext import (
     filters,
 )
 
+from .agent_announce import announce_agent_change
 from .config import config
 from .handlers.callback_data import (
     CB_ASK_DOWN,
@@ -2012,7 +2013,11 @@ async def post_init(application: Application) -> None:
     async def message_callback(msg: NewMessage) -> None:
         await handle_new_message(msg, application.bot)
 
+    async def agent_change_callback(window_id: str) -> None:
+        await announce_agent_change(window_id, application.bot)
+
     monitor.set_message_callback(message_callback)
+    monitor.set_agent_change_callback(agent_change_callback)
     monitor.start()
     session_monitor = monitor
     logger.info("Session monitor started")
