@@ -660,8 +660,10 @@ class SessionManager:
                 state.session_id = new_sid
                 state.cwd = new_cwd
                 changed = True
-            # Update display name
-            if new_wname:
+            # Update display name. session_map records the name the window had
+            # when Claude started — "projects-2" and the like. Once a topic has
+            # earned a real name, that stale value must not overwrite it.
+            if new_wname and not state.auto_named:
                 state.window_name = new_wname
                 if self.window_display_names.get(window_id) != new_wname:
                     self.window_display_names[window_id] = new_wname
