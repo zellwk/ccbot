@@ -5,8 +5,8 @@ Provides background polling of terminal status lines for all active users:
   - Detects interactive UIs (permission prompts) not triggered via JSONL
   - Updates status messages in Telegram
   - Polls thread_bindings (each topic = one window)
-  - Periodically probes topic existence via unpin_all_forum_topic_messages
-    (silent no-op when no pins); cleans up deleted topics (kills tmux window
+  - Periodically probes topic existence via edit_forum_topic, re-sending the
+    name the topic already has; cleans up deleted topics (kills tmux window
     + unbinds thread)
 
 Key components:
@@ -135,13 +135,23 @@ async def status_poll_loop(bot: Bot) -> None:
                 for user_id, thread_id, wid in list(
                     session_manager.iter_thread_bindings()
                 ):
+                    # Re-sending the topic's own name is the only call that
+                    # validates a thread id without leaving a trace: a message
+                    # send would post, and unpin/edit-without-a-name return ok
+                    # for thread ids that do not exist. Skip when the display
+                    # name is the window_id fallback — renaming a live topic to
+                    # "@26" is worse than missing one sweep.
+                    name = session_manager.get_display_name(wid)
+                    if name.startswith("@"):
+                        continue
                     try:
-                        await bot.unpin_all_forum_topic_messages(
+                        await bot.edit_forum_topic(
                             chat_id=session_manager.resolve_chat_id(user_id, thread_id),
                             message_thread_id=thread_id,
+                            name=name,
                         )
                     except BadRequest as e:
-                        if "Topic_id_invalid" in str(e):
+                        if "topic_id_invalid" in str(e).lower():
                             # Topic deleted — kill window, unbind, and clean up state
                             w = await tmux_manager.find_window_by_id(wid)
                             if w:
