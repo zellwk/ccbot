@@ -34,6 +34,7 @@ from typing import Any
 import aiofiles
 
 from .config import config
+from .terminal_parser import is_blocking_dialog, is_prompt_ready
 from .tmux_manager import tmux_manager
 from .transcript_parser import TranscriptParser
 from .utils import atomic_write_json
@@ -947,6 +948,35 @@ class SessionManager:
 
     # --- Tmux helpers ---
 
+    async def _clear_blocking_dialog(self, window_id: str, display: str) -> bool:
+        """Dismiss any dialog standing between the pane and Claude's prompt.
+
+        Claude Code shows full-screen dialogs its own upgrades introduce (the
+        auto-mode onboarding, for one).  They match no known UI pattern, so
+        ccbot can neither forward the question nor deliver a message — text
+        sent while one is up is read as navigation keys and vanishes.  Escape
+        backs out of them.
+
+        Known interactive UIs pass through untouched: those get surfaced to
+        the user, whose answer arrives through this same send path.
+
+        Returns True when the prompt is reachable.
+        """
+        for _ in range(3):
+            pane = await tmux_manager.capture_pane(window_id)
+            if pane is None:
+                return True  # Can't read the pane — don't block the send.
+            if not is_blocking_dialog(pane):
+                return True
+            logger.warning("Dismissing blocking dialog in %s", display)
+            await tmux_manager.send_keys(
+                window_id, "Escape", enter=False, literal=False
+            )
+            await asyncio.sleep(0.6)
+
+        pane = await tmux_manager.capture_pane(window_id)
+        return pane is None or is_prompt_ready(pane)
+
     async def send_to_window(self, window_id: str, text: str) -> tuple[bool, str]:
         """Send text to a tmux window by ID."""
         display = self.get_display_name(window_id)
@@ -959,6 +989,11 @@ class SessionManager:
         window = await tmux_manager.find_window_by_id(window_id)
         if not window:
             return False, "Window not found (may have been closed)"
+        if not await self._clear_blocking_dialog(window.window_id, display):
+            return False, (
+                f"{display} is stuck on a dialog I couldn't dismiss — "
+                f"send /screenshot to see it, or /esc to clear it"
+            )
         success = await tmux_manager.send_keys(window.window_id, text)
         if success:
             return True, f"Sent to {display}"

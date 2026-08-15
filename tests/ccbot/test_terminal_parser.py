@@ -5,7 +5,9 @@ import pytest
 from ccbot.terminal_parser import (
     extract_bash_output,
     extract_interactive_content,
+    is_blocking_dialog,
     is_interactive_ui,
+    is_prompt_ready,
     parse_status_line,
     strip_pane_chrome,
 )
@@ -280,3 +282,107 @@ class TestExtractBashOutput:
         result = extract_bash_output(pane, "echo hi")
         assert result is not None
         assert not result.endswith("\n")
+
+
+# ── is_prompt_ready / is_blocking_dialog ─────────────────────────────────
+
+BAR = "─" * 80
+IDLE_PANE = (
+    "  Two weeks since my last note. What's on today?\n"
+    "\n"
+    "✻ Cooked for 19s\n"
+    "\n" + "─" * 72 + " shiz ──\n"
+    "❯ catch me up on what's open\n" + BAR + "\n"
+    "  ⏸ manual mode on · ? for shortcuts · ← for agents\n"
+)
+
+# Full-screen onboarding: keeps the box borders, drops the ❯ line and footer.
+ONBOARDING_MENU_PANE = (
+    "─" * 72 + " shiz ──\n"
+    "\n" + BAR + "\n"
+    " Make auto mode your default permission mode?\n"
+    "\n"
+    "   Auto mode lets Claude handle permission prompts automatically.\n"
+    "\n"
+    "   ❯ 1. Yes, set auto mode as my default permission mode\n"
+    "     2. No, keep manual mode\n"
+)
+
+ONBOARDING_FORM_PANE = (
+    "▔" * 80 + "\n"
+    "   Set up auto mode for your environment?\n"
+    "\n"
+    "   Claude Code reads this project and your recent Claude sessions.\n"
+    "\n"
+    "     How you use Claude here    ◀ Mixed ▶\n"
+    "   ❯ Also scan shell history    [ ]\n"
+    "\n"
+    "     Continue\n"
+    "\n"
+    "   ←/→ to change usage · Enter to continue · Esc to cancel\n"
+)
+
+
+class TestIsPromptReady:
+    def test_idle_prompt_is_ready(self):
+        assert is_prompt_ready(IDLE_PANE) is True
+
+    def test_mid_turn_prompt_is_ready(self):
+        pane = IDLE_PANE.replace("? for shortcuts", "esc to interrupt")
+        assert is_prompt_ready(pane) is True
+
+    def test_empty_prompt_is_ready(self):
+        assert (
+            is_prompt_ready(IDLE_PANE.replace("catch me up on what's open", "")) is True
+        )
+
+    def test_onboarding_menu_is_not_ready(self):
+        assert is_prompt_ready(ONBOARDING_MENU_PANE) is False
+
+    def test_onboarding_form_is_not_ready(self):
+        assert is_prompt_ready(ONBOARDING_FORM_PANE) is False
+
+    def test_empty_pane_is_not_ready(self):
+        assert is_prompt_ready("") is False
+
+    def test_separator_without_footer_is_not_ready(self):
+        assert is_prompt_ready("❯ typing\n" + BAR + "\n") is False
+
+
+class TestIsBlockingDialog:
+    def test_idle_prompt_does_not_block(self):
+        assert is_blocking_dialog(IDLE_PANE) is False
+
+    def test_unrecognised_onboarding_blocks(self):
+        assert is_blocking_dialog(ONBOARDING_MENU_PANE) is True
+        assert is_blocking_dialog(ONBOARDING_FORM_PANE) is True
+
+    def test_known_interactive_ui_does_not_block(self):
+        pane = "  Do you want to proceed?\n  ❯ 1. Yes\n    2. No\n  Esc to cancel\n"
+        assert is_interactive_ui(pane) is True
+        assert is_blocking_dialog(pane) is False
+
+    def test_trust_folder_prompt_does_not_block(self):
+        """Claude Code's first-run folder check is a recognised UI."""
+        pane = (
+            "  Do you want to proceed?\n"
+            "  Claude Code'll be able to read, edit, and execute files here.\n"
+            "\n"
+            "  ❯ 1. Yes, I trust this folder\n"
+            "    2. No, exit\n"
+            "\n"
+            "  Enter to confirm · Esc to cancel\n"
+        )
+        assert is_blocking_dialog(pane) is False
+
+    @pytest.mark.parametrize(
+        "pane",
+        [
+            pytest.param("", id="empty"),
+            pytest.param("\n\n\n", id="blank_lines"),
+            pytest.param("Booting…\n\n", id="one_line"),
+        ],
+    )
+    def test_window_still_drawing_does_not_block(self, pane: str):
+        """A pane mid-boot buffers keystrokes; it is not a dialog."""
+        assert is_blocking_dialog(pane) is False

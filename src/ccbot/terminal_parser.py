@@ -5,12 +5,15 @@ Parses captured tmux pane content to detect:
     RestoreCheckpoint) via regex-based UIPattern matching with top/bottom
     delimiters.
   - Status line (spinner characters + working text) by scanning from bottom up.
+  - Prompt readiness — whether the input box is on screen, so a send reaches
+    Claude rather than a dialog drawn over it.
 
 All Claude Code text patterns live here. To support a new UI type or
 a changed Claude Code version, edit UI_PATTERNS / STATUS_SPINNERS.
 
 Key functions: is_interactive_ui(), extract_interactive_content(),
-parse_status_line(), strip_pane_chrome(), extract_bash_output().
+is_prompt_ready(), is_blocking_dialog(), parse_status_line(),
+strip_pane_chrome(), extract_bash_output().
 """
 
 import re
@@ -191,6 +194,63 @@ def extract_interactive_content(pane_text: str) -> InteractiveUIContent | None:
 def is_interactive_ui(pane_text: str) -> bool:
     """Check if terminal currently shows an interactive UI."""
     return extract_interactive_content(pane_text) is not None
+
+
+# ── Prompt readiness ─────────────────────────────────────────────────────
+
+_RE_PROMPT_LINE = re.compile(r"^\s*❯")
+
+
+def is_prompt_ready(pane_text: str) -> bool:
+    """Check whether keystrokes sent to the pane will reach Claude's prompt.
+
+    The input box closes with a bare ``─`` separator that has a ``❯`` line
+    just above it and the status footer just below::
+
+        ──────────────────────────────────── shiz ──
+        ❯ catch me up on what's open
+        ────────────────────────────────────────────
+          ⏸ manual mode on · ? for shortcuts
+
+    Dialogs draw over that region, keeping the borders but replacing the
+    ``❯`` line and dropping the footer, so text typed into them never becomes
+    a prompt.  Matching on the closing separator's neighbours tells the two
+    apart; a menu's ``❯ 1. Yes`` has no separator under it.
+
+    Returns True while Claude is mid-turn — the box stays visible and accepts
+    queued input.
+    """
+    if not pane_text:
+        return False
+
+    tail = pane_text.rstrip().split("\n")[-12:]
+
+    for i in range(len(tail) - 1, -1, -1):
+        stripped = tail[i].strip()
+        if len(stripped) < 20 or any(c != "─" for c in stripped):
+            continue
+        # Footer must follow, and the prompt line sits just above.
+        if not any(line.strip() for line in tail[i + 1 :]):
+            return False
+        return any(_RE_PROMPT_LINE.match(line) for line in tail[max(0, i - 5) : i])
+    return False
+
+
+def is_blocking_dialog(pane_text: str) -> bool:
+    """Check whether the pane shows a dialog that swallows input silently.
+
+    True when the input box is gone *and* the screen matches no known
+    interactive UI — so ccbot can neither forward the question nor deliver a
+    message.  Known UIs are excluded: those get surfaced to the user, who
+    answers them through the normal send path.
+
+    A near-empty pane is a window still drawing its first frame, not a
+    dialog.  Claude Code buffers keystrokes that arrive while it boots, so
+    those sends go through untouched.
+    """
+    if len([line for line in pane_text.split("\n") if line.strip()]) < 3:
+        return False
+    return not is_prompt_ready(pane_text) and not is_interactive_ui(pane_text)
 
 
 # ── Status line parsing ─────────────────────────────────────────────────
