@@ -148,9 +148,6 @@ async def send_history(
                 )
             else:
                 await safe_reply(target, text, reply_markup=keyboard)
-            # Update offset even if no assistant messages
-            if user_id is not None and end_byte > 0:
-                session_manager.update_user_window_offset(user_id, window_id, end_byte)
             return
 
         if is_unread:
@@ -230,6 +227,3 @@ async def send_history(
     else:
         await safe_reply(target, text, reply_markup=keyboard)
 
-    # Update user's read offset after viewing unread
-    if is_unread and user_id is not None and end_byte > 0:
-        session_manager.update_user_window_offset(user_id, window_id, end_byte)

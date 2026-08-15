@@ -135,7 +135,7 @@ class TestDisplayNames:
 
     def test_set_display_name_update(self, mgr: SessionManager) -> None:
         mgr.bind_thread(100, 1, "@1", window_name="old-name")
-        mgr.window_display_names["@1"] = "new-name"
+        mgr.update_display_name("@1", "new-name")
         assert mgr.get_display_name("@1") == "new-name"
 
     def test_bind_thread_sets_display_name(self, mgr: SessionManager) -> None:
@@ -211,10 +211,8 @@ class TestResolveStaleIds:
     """Regression tests for startup re-resolution after tmux server restart.
 
     IMPORTANT: window IDs reset when the tmux server restarts; thread
-    bindings MUST survive by re-resolving through display names. A previous
-    bug popped window_display_names entries while migrating window_states,
-    so the thread_bindings loop could no longer resolve the same stale ID
-    and silently dropped every topic binding.
+    bindings MUST survive by re-resolving through display names, which are
+    the only identifier that outlives the old id.
     """
 
     def _setup(self, mgr: SessionManager, monkeypatch, tmp_path, live) -> None:
@@ -229,17 +227,14 @@ class TestResolveStaleIds:
         )
 
     @pytest.mark.asyncio
-    async def test_tmux_restart_remaps_bindings_and_offsets(
+    async def test_tmux_restart_remaps_the_record(
         self, mgr: SessionManager, monkeypatch, tmp_path
     ) -> None:
-        """All state keyed by a stale window_id follows it to the new id."""
+        """The whole record follows a stale window_id to the new id."""
         state = mgr.get_window_state("@5")
         state.session_id = "sid-1"
         state.cwd = "/proj"
-        state.window_name = "proj"
-        mgr.window_display_names["@5"] = "proj"
         mgr.bind_thread(100, 42, "@5", window_name="proj")
-        mgr.user_window_offsets = {100: {"@5": 123}}
 
         # tmux restarted: same window name, new id
         self._setup(mgr, monkeypatch, tmp_path, [TmuxWindow("@1", "proj", "/proj")])
@@ -248,15 +243,13 @@ class TestResolveStaleIds:
         assert mgr.get_window_for_thread(100, 42) == "@1"
         assert mgr.window_states["@1"].session_id == "sid-1"
         assert "@5" not in mgr.window_states
-        assert mgr.user_window_offsets[100] == {"@1": 123}
         assert mgr.get_display_name("@1") == "proj"
 
     @pytest.mark.asyncio
     async def test_binding_without_window_state_still_remaps(
         self, mgr: SessionManager, monkeypatch, tmp_path
     ) -> None:
-        """Bindings resolve via display names even with no window_state entry."""
-        mgr.window_display_names["@7"] = "other"
+        """Bindings resolve via the display name after the id goes stale."""
         mgr.bind_thread(100, 9, "@7", window_name="other")
 
         self._setup(mgr, monkeypatch, tmp_path, [TmuxWindow("@2", "other", "/o")])
@@ -269,7 +262,6 @@ class TestResolveStaleIds:
         self, mgr: SessionManager, monkeypatch, tmp_path
     ) -> None:
         """A stale binding with no live window of the same name is dropped."""
-        mgr.window_display_names["@5"] = "gone"
         mgr.bind_thread(100, 42, "@5", window_name="gone")
 
         self._setup(mgr, monkeypatch, tmp_path, [TmuxWindow("@1", "unrelated", "/u")])
@@ -278,11 +270,33 @@ class TestResolveStaleIds:
         assert mgr.get_window_for_thread(100, 42) is None
 
     @pytest.mark.asyncio
+    async def test_stale_record_never_clobbers_a_live_namesake(
+        self, mgr: SessionManager, monkeypatch, tmp_path
+    ) -> None:
+        """tmux reuses a name once the original window dies.
+
+        The dead record must not be re-resolved onto the live window of the
+        same name — that would overwrite a live session and drop its topic.
+        """
+        dead = mgr.get_window_state("@31")
+        dead.session_id = "sid-dead"
+        dead.window_name = "projects-2"
+
+        mgr.bind_thread(100, 55, "@38", window_name="projects-2")
+        mgr.get_window_state("@38").session_id = "sid-live"
+
+        self._setup(mgr, monkeypatch, tmp_path, [TmuxWindow("@38", "projects-2", "/p")])
+        await mgr.resolve_stale_ids()
+
+        assert mgr.window_states["@38"].session_id == "sid-live"
+        assert mgr.get_window_for_thread(100, 55) == "@38"
+        assert "@31" not in mgr.window_states
+
+    @pytest.mark.asyncio
     async def test_live_ids_untouched(
         self, mgr: SessionManager, monkeypatch, tmp_path
     ) -> None:
         """Bindings pointing at still-live window IDs are kept as-is."""
-        mgr.window_display_names["@3"] = "keep"
         mgr.bind_thread(100, 7, "@3", window_name="keep")
         state = mgr.get_window_state("@3")
         state.session_id = "sid-keep"
@@ -342,3 +356,63 @@ class TestLoadSessionMapMigration:
 
         await mgr.load_session_map()
         assert mgr.get_window_state("@4").session_id == "sid-1"
+
+
+class TestStateMigration:
+    """v1 spread a window across four maps; v2 keeps one record per window."""
+
+    V1 = {
+        "window_states": {
+            "@3": {"session_id": "sid-a", "cwd": "/proj", "auto_named": True},
+        },
+        "window_display_names": {"@3": "Real Name", "@9": "Orphan"},
+        "thread_bindings": {"100": {"42": "@3"}},
+        "user_window_offsets": {"100": {"@3": 999}},
+        "group_chat_ids": {"100:42": -1001234},
+    }
+
+    def _load(self, monkeypatch, tmp_path, payload) -> SessionManager:
+        path = tmp_path / "state.json"
+        path.write_text(json.dumps(payload))
+        monkeypatch.setattr(session_mod.config, "state_file", path)
+        monkeypatch.setattr(SessionManager, "_save_state", lambda self: None)
+        return SessionManager()
+
+    def test_v1_folds_into_one_record(self, monkeypatch, tmp_path) -> None:
+        mgr = self._load(monkeypatch, tmp_path, self.V1)
+        ws = mgr.window_states["@3"]
+        assert ws.session_id == "sid-a"
+        assert ws.cwd == "/proj"
+        assert ws.auto_named is True
+        assert ws.window_name == "Real Name"
+        assert (ws.user_id, ws.thread_id) == (100, 42)
+        assert mgr.get_window_for_thread(100, 42) == "@3"
+        assert mgr.get_display_name("@3") == "Real Name"
+
+    def test_v1_display_name_without_window_state_survives(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        """A name with no window_states entry still becomes a record."""
+        mgr = self._load(monkeypatch, tmp_path, self.V1)
+        assert mgr.get_display_name("@9") == "Orphan"
+
+    def test_group_chat_ids_kept(self, monkeypatch, tmp_path) -> None:
+        mgr = self._load(monkeypatch, tmp_path, self.V1)
+        assert mgr.resolve_chat_id(100, 42) == -1001234
+
+    def test_dead_offsets_dropped(self, monkeypatch, tmp_path) -> None:
+        """monitor_state.json owns byte offsets; v1's copy was never read."""
+        mgr = self._load(monkeypatch, tmp_path, self.V1)
+        assert not hasattr(mgr, "user_window_offsets")
+
+    def test_v2_round_trips(self, monkeypatch, tmp_path) -> None:
+        mgr = self._load(monkeypatch, tmp_path, self.V1)
+        v2 = {
+            "version": 2,
+            "window_states": {k: v.to_dict() for k, v in mgr.window_states.items()},
+            "group_chat_ids": mgr.group_chat_ids,
+        }
+        again = self._load(monkeypatch, tmp_path, v2)
+        assert again.get_window_for_thread(100, 42) == "@3"
+        assert again.get_display_name("@3") == "Real Name"
+        assert again.window_states["@3"].auto_named is True

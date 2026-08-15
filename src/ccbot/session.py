@@ -1,17 +1,15 @@
 """Claude Code session management — the core state hub.
 
-Manages the key mappings:
-  Window→Session (window_states): which Claude session_id a window holds (keyed by window_id).
-  User→Thread→Window (thread_bindings): topic-to-window bindings (1 topic = 1 window_id).
+One record per tmux window, keyed by window_id, holds everything known about
+that window: the Claude session it runs, its working directory, its display
+name, and the Telegram topic bound to it (1 topic = 1 window).
 
 Responsibilities:
   - Persist/load state to ~/.ccbot/state.json.
   - Sync window↔session bindings from session_map.json (written by hook).
   - Resolve window IDs to ClaudeSession objects (JSONL file reading).
-  - Track per-user read offsets for unread-message detection.
   - Manage thread↔window bindings for Telegram topic routing.
   - Send keystrokes to tmux windows and retrieve message history.
-  - Maintain window_id→display name mapping for UI display.
   - Re-resolve stale window IDs on startup (tmux server restart recovery).
 
 Key class: SessionManager (singleton instantiated as `session_manager`).
@@ -46,17 +44,24 @@ logger = logging.getLogger(__name__)
 class WindowState:
     """Persistent state for a tmux window.
 
+    One record per tmux window holds everything known about it. Nothing about
+    a window is stored anywhere else in this file.
+
     Attributes:
         session_id: Associated Claude session ID (empty if not yet detected)
         cwd: Working directory for direct file path construction
-        window_name: Display name of the window
+        window_name: Display name — mirrors the tmux window name
         auto_named: Topic has a real name — skip auto-naming from now on
+        user_id: Telegram user whose topic is bound here (None if unbound)
+        thread_id: Telegram topic thread bound here (None if unbound)
     """
 
     session_id: str = ""
     cwd: str = ""
     window_name: str = ""
     auto_named: bool = False
+    user_id: int | None = None
+    thread_id: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {
@@ -67,15 +72,23 @@ class WindowState:
             d["window_name"] = self.window_name
         if self.auto_named:
             d["auto_named"] = True
+        if self.user_id is not None:
+            d["user_id"] = self.user_id
+        if self.thread_id is not None:
+            d["thread_id"] = self.thread_id
         return d
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "WindowState":
+        uid = data.get("user_id")
+        tid = data.get("thread_id")
         return cls(
             session_id=data.get("session_id", ""),
             cwd=data.get("cwd", ""),
             window_name=data.get("window_name", ""),
             auto_named=bool(data.get("auto_named", False)),
+            user_id=int(uid) if uid is not None else None,
+            thread_id=int(tid) if tid is not None else None,
         )
 
 
@@ -96,18 +109,16 @@ class SessionManager:
     All internal keys use window_id (e.g. '@0', '@12') for uniqueness.
     Display names (window_name) are stored separately for UI presentation.
 
-    window_states: window_id -> WindowState (session_id, cwd, window_name)
-    user_window_offsets: user_id -> {window_id -> byte_offset}
-    thread_bindings: user_id -> {thread_id -> window_id}
-    window_display_names: window_id -> window_name (for display)
-    group_chat_ids: "user_id:thread_id" -> group chat_id (for supergroup routing)
+    window_states: window_id -> WindowState. The single record for a window —
+    its session, cwd, display name, and the topic bound to it. Look up
+    anything about a window here; there is no second place to check.
+
+    group_chat_ids: "user_id:thread_id" -> group chat_id (for supergroup
+    routing). Stays separate because it is keyed by thread, is written before
+    a window exists, and must outlive unbinding.
     """
 
     window_states: dict[str, WindowState] = field(default_factory=dict)
-    user_window_offsets: dict[int, dict[str, int]] = field(default_factory=dict)
-    thread_bindings: dict[int, dict[int, str]] = field(default_factory=dict)
-    # window_id -> display name (window_name)
-    window_display_names: dict[str, str] = field(default_factory=dict)
     # "user_id:thread_id" -> group chat_id (for supergroup forum topic routing)
     # IMPORTANT: This mapping is essential for supergroup/forum topic support.
     # Telegram Bot API requires group chat_id (negative number like -100xxx)
@@ -123,15 +134,8 @@ class SessionManager:
 
     def _save_state(self) -> None:
         state: dict[str, Any] = {
+            "version": 2,
             "window_states": {k: v.to_dict() for k, v in self.window_states.items()},
-            "user_window_offsets": {
-                str(uid): offsets for uid, offsets in self.user_window_offsets.items()
-            },
-            "thread_bindings": {
-                str(uid): {str(tid): wid for tid, wid in bindings.items()}
-                for uid, bindings in self.thread_bindings.items()
-            },
-            "window_display_names": self.window_display_names,
             "group_chat_ids": self.group_chat_ids,
         }
         atomic_write_json(config.state_file, state)
@@ -141,60 +145,58 @@ class SessionManager:
         """Check if a key looks like a tmux window ID (e.g. '@0', '@12')."""
         return key.startswith("@") and len(key) > 1 and key[1:].isdigit()
 
+    @staticmethod
+    def _fold_v1(state: dict[str, Any]) -> dict[str, dict[str, Any]]:
+        """Fold the pre-v2 state layout into one record per window.
+
+        v1 spread a window across four maps: window_states, thread_bindings,
+        window_display_names and user_window_offsets. The offsets were never
+        read — monitor_state.json tracks the byte offsets that actually
+        matter — so they are dropped rather than carried over.
+        """
+        records: dict[str, dict[str, Any]] = {
+            k: dict(v) for k, v in state.get("window_states", {}).items()
+        }
+        for wid, name in state.get("window_display_names", {}).items():
+            records.setdefault(wid, {})["window_name"] = name
+        for uid, bindings in state.get("thread_bindings", {}).items():
+            for tid, wid in bindings.items():
+                rec = records.setdefault(wid, {})
+                rec["user_id"] = int(uid)
+                rec["thread_id"] = int(tid)
+        return records
+
     def _load_state(self) -> None:
         """Load state synchronously during initialization.
 
-        Detects old-format state (window_name keys without '@' prefix) and
-        marks for migration on next startup re-resolution.
+        Reads either layout: v2 stores one record per window, v1 spread the
+        same fields across four maps. Old-format keys (window_name rather
+        than window_id) are re-resolved against live tmux on startup.
         """
         if config.state_file.exists():
             try:
                 state = json.loads(config.state_file.read_text())
+                if state.get("version", 1) < 2:
+                    logger.info("Migrating state to the single-record layout")
+                    raw = self._fold_v1(state)
+                else:
+                    raw = state.get("window_states", {})
                 self.window_states = {
-                    k: WindowState.from_dict(v)
-                    for k, v in state.get("window_states", {}).items()
+                    k: WindowState.from_dict(v) for k, v in raw.items()
                 }
-                self.user_window_offsets = {
-                    int(uid): offsets
-                    for uid, offsets in state.get("user_window_offsets", {}).items()
-                }
-                self.thread_bindings = {
-                    int(uid): {int(tid): wid for tid, wid in bindings.items()}
-                    for uid, bindings in state.get("thread_bindings", {}).items()
-                }
-                self.window_display_names = state.get("window_display_names", {})
                 self.group_chat_ids = {
                     k: int(v) for k, v in state.get("group_chat_ids", {}).items()
                 }
 
-                # Detect old format: keys that don't look like window IDs
-                needs_migration = False
-                for k in self.window_states:
-                    if not self._is_window_id(k):
-                        needs_migration = True
-                        break
-                if not needs_migration:
-                    for bindings in self.thread_bindings.values():
-                        for wid in bindings.values():
-                            if not self._is_window_id(wid):
-                                needs_migration = True
-                                break
-                        if needs_migration:
-                            break
-
-                if needs_migration:
+                if any(not self._is_window_id(k) for k in self.window_states):
                     logger.info(
                         "Detected old-format state (window_name keys), "
                         "will re-resolve on startup"
                     )
-                    pass
 
             except (json.JSONDecodeError, ValueError) as e:
                 logger.warning("Failed to load state: %s", e)
                 self.window_states = {}
-                self.user_window_offsets = {}
-                self.thread_bindings = {}
-                self.window_display_names = {}
                 self.group_chat_ids = {}
                 pass
 
@@ -214,134 +216,56 @@ class SessionManager:
             live_by_name[w.window_name] = w.window_id
             live_ids.add(w.window_id)
 
-        # Snapshot old_id -> display_name BEFORE any mutation: the loops below
-        # rewrite window_display_names as they go, and thread_bindings /
-        # user_window_offsets must still resolve stale IDs against the old view.
-        old_names: dict[str, str] = dict(self.window_display_names)
-        for key, ws in self.window_states.items():
-            if ws.window_name and key not in old_names:
-                old_names[key] = ws.window_name
-
         changed = False
-
-        # --- Migrate window_states ---
-        new_window_states: dict[str, WindowState] = {}
-        for key, ws in self.window_states.items():
+        resolved: dict[str, WindowState] = {}
+        # Records already on a live id are authoritative and are taken first.
+        # A stale record may share its name with a live window (tmux reuses
+        # "projects-2" once the original is gone), and must never overwrite
+        # the live one — that would hand the live window a dead session and
+        # drop the topic bound to it.
+        ordered = sorted(
+            self.window_states.items(), key=lambda kv: kv[0] not in live_ids
+        )
+        for key, ws in ordered:
             if self._is_window_id(key):
                 if key in live_ids:
-                    new_window_states[key] = ws
+                    resolved[key] = ws
+                    continue
+                # Stale ID — the tmux server restarted and handed out new ones.
+                # The display name is what survives, so re-resolve through it.
+                name = ws.window_name or key
+                new_id = live_by_name.get(name)
+                if new_id in resolved:
+                    logger.info(
+                        "Dropping stale window_state %s: %s already holds '%s'",
+                        key,
+                        new_id,
+                        name,
+                    )
+                elif new_id:
+                    logger.info(
+                        "Re-resolved stale window_id %s -> %s (name=%s)",
+                        key,
+                        new_id,
+                        name,
+                    )
+                    resolved[new_id] = ws
                 else:
-                    # Stale ID — try re-resolve by display name
-                    display = old_names.get(key, key)
-                    new_id = live_by_name.get(display)
-                    if new_id:
-                        logger.info(
-                            "Re-resolved stale window_id %s -> %s (name=%s)",
-                            key,
-                            new_id,
-                            display,
-                        )
-                        new_window_states[new_id] = ws
-                        ws.window_name = display
-                        self.window_display_names[new_id] = display
-                        self.window_display_names.pop(key, None)
-                        changed = True
-                    else:
-                        logger.info(
-                            "Dropping stale window_state: %s (name=%s)", key, display
-                        )
-                        changed = True
+                    logger.info("Dropping stale window_state: %s (name=%s)", key, name)
             else:
-                # Old format: key is window_name
+                # Old format: the key was the window name.
                 new_id = live_by_name.get(key)
-                if new_id:
+                if new_id and new_id not in resolved:
                     logger.info("Migrating window_state key %s -> %s", key, new_id)
                     ws.window_name = key
-                    new_window_states[new_id] = ws
-                    self.window_display_names[new_id] = key
-                    changed = True
+                    resolved[new_id] = ws
                 else:
                     logger.info(
                         "Dropping old-format window_state: %s (no live window)", key
                     )
-                    changed = True
-        self.window_states = new_window_states
+            changed = True
 
-        # --- Migrate thread_bindings ---
-        for uid, bindings in self.thread_bindings.items():
-            new_bindings: dict[int, str] = {}
-            for tid, val in bindings.items():
-                if self._is_window_id(val):
-                    if val in live_ids:
-                        new_bindings[tid] = val
-                    else:
-                        display = old_names.get(val, val)
-                        new_id = live_by_name.get(display)
-                        if new_id:
-                            logger.info(
-                                "Re-resolved thread binding %s -> %s (name=%s)",
-                                val,
-                                new_id,
-                                display,
-                            )
-                            new_bindings[tid] = new_id
-                            self.window_display_names[new_id] = display
-                            changed = True
-                        else:
-                            logger.info(
-                                "Dropping stale thread binding: user=%d, thread=%d, wid=%s",
-                                uid,
-                                tid,
-                                val,
-                            )
-                            changed = True
-                else:
-                    # Old format: val is window_name
-                    new_id = live_by_name.get(val)
-                    if new_id:
-                        logger.info("Migrating thread binding %s -> %s", val, new_id)
-                        new_bindings[tid] = new_id
-                        self.window_display_names[new_id] = val
-                        changed = True
-                    else:
-                        logger.info(
-                            "Dropping old-format thread binding: user=%d, thread=%d, name=%s",
-                            uid,
-                            tid,
-                            val,
-                        )
-                        changed = True
-            self.thread_bindings[uid] = new_bindings
-
-        # Remove empty user entries
-        empty_users = [uid for uid, b in self.thread_bindings.items() if not b]
-        for uid in empty_users:
-            del self.thread_bindings[uid]
-
-        # --- Migrate user_window_offsets ---
-        for uid, offsets in self.user_window_offsets.items():
-            new_offsets: dict[str, int] = {}
-            for key, offset in offsets.items():
-                if self._is_window_id(key):
-                    if key in live_ids:
-                        new_offsets[key] = offset
-                    else:
-                        display = old_names.get(key, key)
-                        new_id = live_by_name.get(display)
-                        if new_id:
-                            new_offsets[new_id] = offset
-                            changed = True
-                        else:
-                            changed = True
-                else:
-                    new_id = live_by_name.get(key)
-                    if new_id:
-                        new_offsets[new_id] = offset
-                        changed = True
-                    else:
-                        changed = True
-            self.user_window_offsets[uid] = new_offsets
-
+        self.window_states = resolved
         if changed:
             self._save_state()
             logger.info("Startup re-resolution complete")
@@ -507,14 +431,12 @@ class SessionManager:
 
     def get_display_name(self, window_id: str) -> str:
         """Get display name for a window_id, fallback to window_id itself."""
-        return self.window_display_names.get(window_id, window_id)
+        ws = self.window_states.get(window_id)
+        return ws.window_name if ws and ws.window_name else window_id
 
     def update_display_name(self, window_id: str, new_name: str) -> None:
         """Update the display name for a window and persist state."""
-        self.window_display_names[window_id] = new_name
-        # Also update WindowState.window_name if it exists
-        if window_id in self.window_states:
-            self.window_states[window_id].window_name = new_name
+        self.get_window_state(window_id).window_name = new_name
         self._save_state()
         logger.info("Updated display name: window_id %s -> '%s'", window_id, new_name)
 
@@ -664,11 +586,9 @@ class SessionManager:
             # Update display name. session_map records the name the window had
             # when Claude started — "projects-2" and the like. Once a topic has
             # earned a real name, that stale value must not overwrite it.
-            if new_wname and not state.auto_named:
+            if new_wname and not state.auto_named and state.window_name != new_wname:
                 state.window_name = new_wname
-                if self.window_display_names.get(window_id) != new_wname:
-                    self.window_display_names[window_id] = new_wname
-                    changed = True
+                changed = True
 
         # Clean up window_states entries not in current session_map.
         stale_wids = [w for w in self.window_states if w and w not in valid_wids]
@@ -841,17 +761,6 @@ class SessionManager:
         self._save_state()
         return None
 
-    # --- User window offset management ---
-
-    def update_user_window_offset(
-        self, user_id: int, window_id: str, offset: int
-    ) -> None:
-        """Update the user's last read offset for a window."""
-        if user_id not in self.user_window_offsets:
-            self.user_window_offsets[user_id] = {}
-        self.user_window_offsets[user_id][window_id] = offset
-        self._save_state()
-
     # --- Thread binding management ---
 
     def bind_thread(
@@ -865,11 +774,19 @@ class SessionManager:
             window_id: Tmux window ID (e.g. '@0')
             window_name: Display name for the window (optional)
         """
-        if user_id not in self.thread_bindings:
-            self.thread_bindings[user_id] = {}
-        self.thread_bindings[user_id][thread_id] = window_id
+        for other_id, other in self.window_states.items():
+            if (
+                other_id != window_id
+                and other.thread_id == thread_id
+                and other.user_id == user_id
+            ):
+                other.user_id = None
+                other.thread_id = None
+        ws = self.get_window_state(window_id)
+        ws.user_id = user_id
+        ws.thread_id = thread_id
         if window_name:
-            self.window_display_names[window_id] = window_name
+            ws.window_name = window_name
         self._save_state()
         display = window_name or self.get_display_name(window_id)
         logger.info(
@@ -882,12 +799,12 @@ class SessionManager:
 
     def unbind_thread(self, user_id: int, thread_id: int) -> str | None:
         """Remove a thread binding. Returns the previously bound window_id, or None."""
-        bindings = self.thread_bindings.get(user_id)
-        if not bindings or thread_id not in bindings:
+        window_id = self.get_window_for_thread(user_id, thread_id)
+        if window_id is None:
             return None
-        window_id = bindings.pop(thread_id)
-        if not bindings:
-            del self.thread_bindings[user_id]
+        ws = self.window_states[window_id]
+        ws.user_id = None
+        ws.thread_id = None
         self._save_state()
         logger.info(
             "Unbound thread %d (was %s) for user %d",
@@ -899,10 +816,10 @@ class SessionManager:
 
     def get_window_for_thread(self, user_id: int, thread_id: int) -> str | None:
         """Look up the window_id bound to a thread."""
-        bindings = self.thread_bindings.get(user_id)
-        if not bindings:
-            return None
-        return bindings.get(thread_id)
+        for window_id, ws in self.window_states.items():
+            if ws.user_id == user_id and ws.thread_id == thread_id:
+                return window_id
+        return None
 
     def resolve_window_for_thread(
         self,
@@ -920,12 +837,12 @@ class SessionManager:
     def iter_thread_bindings(self) -> Iterator[tuple[int, int, str]]:
         """Iterate all thread bindings as (user_id, thread_id, window_id).
 
-        Provides encapsulated access to thread_bindings without exposing
-        the internal data structure directly.
+        Provides encapsulated access to the bindings without exposing the
+        internal data structure directly.
         """
-        for user_id, bindings in self.thread_bindings.items():
-            for thread_id, window_id in bindings.items():
-                yield user_id, thread_id, window_id
+        for window_id, ws in self.window_states.items():
+            if ws.user_id is not None and ws.thread_id is not None:
+                yield ws.user_id, ws.thread_id, window_id
 
     async def find_users_for_session(
         self,
