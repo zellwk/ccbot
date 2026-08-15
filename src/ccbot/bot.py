@@ -106,6 +106,7 @@ from .handlers.directory_browser import (
 )
 from .handlers.cleanup import clear_topic_state
 from .handlers.history import send_history
+from .handlers.reap import consume_probe_echo, reap_dead_topics
 from .handlers.interactive_ui import (
     INTERACTIVE_TOOL_NAMES,
     clear_interactive_mode,
@@ -527,6 +528,24 @@ async def topic_closed_handler(
         )
 
 
+async def topic_created_handler(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """A new topic is the one moment the window population grows.
+
+    Telegram never says when a topic dies, so this is where the dead ones get
+    found — before the new window is added to them.
+    """
+    user = update.effective_user
+    if not user or not is_user_allowed(user.id):
+        return
+
+    reaped = await reap_dead_topics(
+        context.bot, user.id, skip_thread=_get_thread_id(update)
+    )
+    logger.info("New topic: reap swept, %d window(s) had no topic left", reaped)
+
+
 async def topic_edited_handler(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
@@ -546,6 +565,19 @@ async def topic_edited_handler(
 
     thread_id = _get_thread_id(update)
     if thread_id is None:
+        return
+
+    # A liveness probe re-sends the name the topic already has. Telegram posts
+    # a service message anyway, so delete it rather than show Zell a rename
+    # that never happened.
+    if await consume_probe_echo(context.bot, user.id, thread_id, new_name):
+        try:
+            await context.bot.delete_message(
+                chat_id=session_manager.resolve_chat_id(user.id, thread_id),
+                message_id=msg.message_id,
+            )
+        except Exception as e:  # noqa: BLE001 - a stray notice is not fatal
+            logger.debug("Could not delete probe echo: %s", e)
         return
 
     wid = session_manager.get_window_for_thread(user.id, thread_id)
@@ -2037,6 +2069,13 @@ def create_bot() -> Application:
         MessageHandler(
             filters.StatusUpdate.FORUM_TOPIC_CLOSED,
             topic_closed_handler,
+        )
+    )
+    # Topic created event — reap windows whose topic is gone before adding one
+    application.add_handler(
+        MessageHandler(
+            filters.StatusUpdate.FORUM_TOPIC_CREATED,
+            topic_created_handler,
         )
     )
     # Topic edited event — sync renamed topic to tmux window
