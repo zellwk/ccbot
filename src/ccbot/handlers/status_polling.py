@@ -18,7 +18,7 @@ import logging
 from telegram import Bot
 
 from ..session import session_manager
-from ..terminal_parser import is_interactive_ui, parse_status_line
+from ..terminal_parser import is_interactive_ui, is_post_turn_status, parse_status_line
 from ..tmux_manager import tmux_manager
 from .interactive_ui import (
     clear_interactive_msg,
@@ -98,6 +98,8 @@ async def update_status_message(
         return
 
     status_line = parse_status_line(pane_text)
+    if is_post_turn_status(status_line):
+        status_line = None
 
     # A parsed status line means Claude is mid-turn — the one place that knows.
     set_typing(bot, user_id, thread_id, bool(status_line))

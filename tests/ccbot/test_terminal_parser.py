@@ -7,6 +7,7 @@ from ccbot.terminal_parser import (
     extract_interactive_content,
     is_blocking_dialog,
     is_interactive_ui,
+    is_post_turn_status,
     is_prompt_ready,
     parse_status_line,
     strip_pane_chrome,
@@ -80,6 +81,39 @@ class TestParseStatusLine:
 
     def test_uses_fixture(self, sample_pane_status_line: str):
         assert parse_status_line(sample_pane_status_line) == "Reading file src/main.py"
+
+
+# ── is_post_turn_status ──────────────────────────────────────────────────
+
+
+class TestIsPostTurnStatus:
+    @pytest.mark.parametrize(
+        "status_line",
+        [
+            "Propagating… (running stop hook · 8s · ↓ 292 tokens)",
+            "Deciphering… (running stop hook · 1m 10s · ↓ 4.1k tokens)",
+            "Wrapping up… (running subagent stop hook · 3s)",
+            "Idling… (RUNNING STOP HOOK · 2s)",
+        ],
+    )
+    def test_post_turn_hooks(self, status_line: str):
+        assert is_post_turn_status(status_line) is True
+
+    @pytest.mark.parametrize(
+        "status_line",
+        [
+            None,
+            "",
+            "Percolating… (12s · ↓ 1.2k tokens)",
+            "Reading file src/main.py",
+            # Mid-turn hooks mean a reply is still coming.
+            "Musing… (running PreToolUse hook · 1s)",
+            "Musing… (running PostToolUse hook · 1s)",
+            "Musing… (running UserPromptSubmit hook · 1s)",
+        ],
+    )
+    def test_still_working(self, status_line: str | None):
+        assert is_post_turn_status(status_line) is False
 
 
 # ── extract_interactive_content ──────────────────────────────────────────

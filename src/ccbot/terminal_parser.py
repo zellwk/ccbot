@@ -13,7 +13,7 @@ a changed Claude Code version, edit UI_PATTERNS / STATUS_SPINNERS.
 
 Key functions: is_interactive_ui(), extract_interactive_content(),
 is_prompt_ready(), is_blocking_dialog(), parse_status_line(),
-strip_pane_chrome(), extract_bash_output().
+is_post_turn_status(), strip_pane_chrome(), extract_bash_output().
 """
 
 import re
@@ -300,6 +300,23 @@ def parse_status_line(pane_text: str) -> str | None:
             return line[1:].strip()
         adjacent = False
     return None
+
+
+# Claude Code keeps the spinner running while it executes Stop and SubagentStop
+# hooks, which fire *after* the turn's final message is written. The optional
+# middle word absorbs "subagent".
+_RE_POST_TURN_HOOK = re.compile(r"running\s+(?:\w+\s+)?stop\s+hook", re.IGNORECASE)
+
+
+def is_post_turn_status(status_line: str | None) -> bool:
+    """Check whether a status line is a hook running after the turn ended.
+
+    A spinner normally means a reply is still coming. During a post-turn hook
+    it means the reply already arrived and Claude is finishing up, so callers
+    that ask "is more content coming?" must treat this as no. Liveness checks
+    such as reap want the opposite and should keep using parse_status_line.
+    """
+    return bool(status_line and _RE_POST_TURN_HOOK.search(status_line))
 
 
 # ── Pane chrome stripping & bash output extraction ─────────────────────
