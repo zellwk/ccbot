@@ -67,6 +67,7 @@ from .handlers.callback_data import (
     CB_ASK_ENTER,
     CB_ASK_ESC,
     CB_ASK_LEFT,
+    CB_ASK_PICK,
     CB_ASK_REFRESH,
     CB_ASK_RIGHT,
     CB_ASK_SPACE,
@@ -116,6 +117,7 @@ from .handlers.interactive_ui import (
     get_interactive_window,
     handle_interactive_ui,
     set_interactive_mode,
+    settle_interactive_msg,
 )
 from .handlers.message_queue import (
     clear_status_msg_info,
@@ -139,7 +141,11 @@ from .session import session_manager
 from .token_usage import read_usage
 from .topic_namer import is_placeholder, maybe_autoname
 from .session_monitor import NewMessage, SessionMonitor
-from .terminal_parser import extract_bash_output, is_interactive_ui
+from .terminal_parser import (
+    extract_bash_output,
+    extract_command_result,
+    is_interactive_ui,
+)
 from .tmux_manager import tmux_manager
 from .transcribe import close_client as close_transcribe_client
 from .transcribe import transcribe_voice
@@ -1815,6 +1821,25 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             await asyncio.sleep(0.5)
             await handle_interactive_ui(context.bot, user.id, window_id, thread_id)
         await query.answer("⇥ Tab")
+
+    # Interactive UI: pick a numbered menu row outright
+    elif data.startswith(CB_ASK_PICK):
+        row_key, _, window_id = data[len(CB_ASK_PICK) :].partition(":")
+        thread_id = _get_thread_id(update)
+        w = await tmux_manager.find_window_by_id(window_id)
+        if not w:
+            await query.answer("Window is gone", show_alert=True)
+            return
+        # The row number both selects and confirms, so the menu closes here.
+        await tmux_manager.send_keys(w.window_id, row_key, enter=False)
+        await asyncio.sleep(0.6)
+        pane = await tmux_manager.capture_pane(w.window_id)
+        result = extract_command_result(pane) if pane else None
+        if pane and not is_interactive_ui(pane) and result:
+            await settle_interactive_msg(context.bot, user.id, result, thread_id)
+        else:
+            await handle_interactive_ui(context.bot, user.id, window_id, thread_id)
+        await query.answer()
 
     # Interactive UI: refresh display
     elif data.startswith(CB_ASK_REFRESH):

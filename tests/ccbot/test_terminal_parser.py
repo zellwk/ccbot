@@ -4,11 +4,14 @@ import pytest
 
 from ccbot.terminal_parser import (
     extract_bash_output,
+    extract_command_result,
     extract_interactive_content,
     is_blocking_dialog,
     is_interactive_ui,
+    is_keystroke_menu,
     is_post_turn_status,
     is_prompt_ready,
+    parse_menu_options,
     parse_status_line,
     strip_pane_chrome,
 )
@@ -222,6 +225,30 @@ class TestExtractInteractiveContent:
     def test_returns_none(self, pane: str):
         assert extract_interactive_content(pane) is None
 
+    def test_switch_model_confirmation(self):
+        pane = (
+            "⏺ Shiz here.\n"
+            "\n"
+            "▔" * 40 + "\n"
+            "   Switch model?\n"
+            "   Your next response will be slower and use more tokens\n"
+            "\n"
+            "   This conversation is cached for the current model. Switching to\n"
+            "   Opus 5 means the full history gets re-read on your next message.\n"
+            "\n"
+            "   ❯ 1. Yes, switch to Opus 5\n"
+            "     2. No, go back\n"
+        )
+        result = extract_interactive_content(pane)
+        assert result is not None
+        assert result.name == "ConfirmChoice"
+        # The reason for the confirmation has to survive, not just the options.
+        assert "cached for the current model" in result.content
+        assert parse_menu_options(result.content) == [
+            ("1", "Yes, switch to Opus 5"),
+            ("2", "No, go back"),
+        ]
+
     def test_min_gap_too_small_returns_none(self):
         pane = "  Do you want to proceed?\n  Esc to cancel\n"
         assert extract_interactive_content(pane) is None
@@ -242,6 +269,80 @@ class TestIsInteractiveUI:
 
     def test_false_for_empty_string(self):
         assert is_interactive_ui("") is False
+
+
+# ── is_keystroke_menu ────────────────────────────────────────────────────
+
+
+class TestIsKeystrokeMenu:
+    def test_true_for_model_picker(self, sample_pane_settings: str):
+        assert is_keystroke_menu(sample_pane_settings) is True
+
+    def test_false_for_ui_that_takes_typed_text(self, sample_pane_exit_plan: str):
+        assert is_keystroke_menu(sample_pane_exit_plan) is False
+
+    def test_false_when_no_ui(self, sample_pane_no_ui: str):
+        assert is_keystroke_menu(sample_pane_no_ui) is False
+
+
+# ── parse_menu_options ───────────────────────────────────────────────────
+
+
+MODEL_MENU = (
+    "  Select model\n"
+    "  Switch between Claude models.\n"
+    "\n"
+    "    1. Default (recommended)  Sonnet 5 · Efficient for routine tasks\n"
+    "    2. Sonnet                 Sonnet 5 · Efficient for routine tasks\n"
+    "    3. Fable                  Fable 5 · Most capable for your hardest and\n"
+    "                              longest-running tasks\n"
+    "  ❯ 4. Opus ✔                 Opus 5 · Best for everyday, complex tasks\n"
+    "    5. Haiku                  Haiku 4.5 · Fastest for quick answers\n"
+    "\n"
+    "  Enter to set as default · s to use this session only · Esc to cancel\n"
+)
+
+
+class TestParseMenuOptions:
+    def test_reads_every_row_in_order(self):
+        assert parse_menu_options(MODEL_MENU) == [
+            ("1", "Default (recommended)"),
+            ("2", "Sonnet"),
+            ("3", "Fable"),
+            ("4", "Opus ✔"),
+            ("5", "Haiku"),
+        ]
+
+    def test_wrapped_description_is_not_a_row(self):
+        assert "longest-running tasks" not in dict(parse_menu_options(MODEL_MENU))
+
+    def test_no_numbered_rows(self):
+        assert parse_menu_options("  Settings: press tab to cycle\n  Esc to cancel\n") == []
+
+
+# ── extract_command_result ───────────────────────────────────────────────
+
+
+class TestExtractCommandResult:
+    def test_reads_the_last_result_line(self):
+        pane = (
+            "❯ /model\n"
+            "  ⎿  Set model to Haiku 4.5 and saved as your default\n"
+            "\n"
+            "❯ /model\n"
+            "  ⎿  Set model to Fable 5 and saved as your default\n"
+            "\n"
+            "─" * 40 + "\n"
+            "❯ \n"
+            "─" * 40 + "\n"
+            "  ⏵⏵ auto mode on\n"
+        )
+        assert extract_command_result(pane) == (
+            "Set model to Fable 5 and saved as your default"
+        )
+
+    def test_none_when_no_result_line(self):
+        assert extract_command_result("❯ hello\n\n" + "─" * 40 + "\n❯ \n") is None
 
 
 # ── strip_pane_chrome ───────────────────────────────────────────────────

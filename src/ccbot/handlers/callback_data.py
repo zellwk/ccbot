@@ -41,6 +41,7 @@ CB_ASK_ENTER = "aq:enter:"  # aq:enter:<window>
 CB_ASK_SPACE = "aq:spc:"  # aq:spc:<window>
 CB_ASK_TAB = "aq:tab:"  # aq:tab:<window>
 CB_ASK_REFRESH = "aq:ref:"  # aq:ref:<window>
+CB_ASK_PICK = "aq:pick:"  # aq:pick:<row_key>:<window>
 
 # Session picker (resume existing session)
 CB_SESSION_SELECT = "rs:sel:"  # rs:sel:<index>

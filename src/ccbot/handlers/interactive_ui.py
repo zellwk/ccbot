@@ -20,13 +20,19 @@ from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.error import BadRequest
 
 from ..session import session_manager
-from ..terminal_parser import extract_interactive_content, is_interactive_ui
+from ..terminal_parser import (
+    KEYSTROKE_MENUS,
+    extract_interactive_content,
+    is_interactive_ui,
+    parse_menu_options,
+)
 from ..tmux_manager import tmux_manager
 from .callback_data import (
     CB_ASK_DOWN,
     CB_ASK_ENTER,
     CB_ASK_ESC,
     CB_ASK_LEFT,
+    CB_ASK_PICK,
     CB_ASK_REFRESH,
     CB_ASK_RIGHT,
     CB_ASK_SPACE,
@@ -81,15 +87,31 @@ def get_interactive_msg_id(user_id: int, thread_id: int | None = None) -> int | 
 def _build_interactive_keyboard(
     window_id: str,
     ui_name: str = "",
+    options: list[tuple[str, str]] | None = None,
 ) -> InlineKeyboardMarkup:
     """Build keyboard for interactive UI navigation.
 
     ``ui_name`` controls the layout: ``RestoreCheckpoint`` omits ←/→ keys
     since only vertical selection is needed.
+
+    ``options`` are the menu's numbered rows.  Each becomes a button that
+    picks that row in one keystroke, which is the only reliable way to choose
+    over Telegram: every arrow tap costs a round trip, and the list wraps, so
+    walking to a row lands on the wrong one whenever a tap arrives late.
     """
     vertical_only = ui_name == "RestoreCheckpoint"
 
     rows: list[list[InlineKeyboardButton]] = []
+    # One button per menu row, two per line to keep labels readable.
+    for i in range(0, len(options or []), 2):
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    label, callback_data=f"{CB_ASK_PICK}{key}:{window_id}"[:64]
+                )
+                for key, label in (options or [])[i : i + 2]
+            ]
+        )
     # Row 1: directional keys
     rows.append(
         [
@@ -180,7 +202,12 @@ async def handle_interactive_ui(
         return False
 
     # Build message with navigation keyboard
-    keyboard = _build_interactive_keyboard(window_id, ui_name=content.name)
+    options = (
+        parse_menu_options(content.content) if content.name in KEYSTROKE_MENUS else []
+    )
+    keyboard = _build_interactive_keyboard(
+        window_id, ui_name=content.name, options=options
+    )
 
     # Send as plain text (no markdown conversion)
     text = content.content
@@ -248,6 +275,39 @@ async def handle_interactive_ui(
                 pass  # Old message may already be gone
         return True
     return False
+
+
+async def settle_interactive_msg(
+    bot: Bot,
+    user_id: int,
+    text: str,
+    thread_id: int | None = None,
+) -> bool:
+    """Turn the interactive message into a record of what the menu did.
+
+    A closed menu leaves nothing behind in the transcript, so deleting its
+    message tells the user only that something vanished.  Rewriting it to the
+    outcome keeps the answer where the question was, and drops the message
+    from tracking so status polling leaves it alone.
+    """
+    ikey = (user_id, thread_id or 0)
+    msg_id = _interactive_msgs.get(ikey)
+    if msg_id is None:
+        return False
+    chat_id = session_manager.resolve_chat_id(user_id, thread_id)
+    try:
+        await bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=msg_id,
+            text=text,
+            link_preview_options=NO_LINK_PREVIEW,
+        )
+    except Exception as e:
+        logger.debug("Failed to settle interactive msg %s: %s", msg_id, e)
+        return False
+    _interactive_msgs.pop(ikey, None)
+    _interactive_mode.pop(ikey, None)
+    return True
 
 
 async def clear_interactive_msg(

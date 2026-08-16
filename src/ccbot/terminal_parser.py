@@ -12,6 +12,7 @@ All Claude Code text patterns live here. To support a new UI type or
 a changed Claude Code version, edit UI_PATTERNS / STATUS_SPINNERS.
 
 Key functions: is_interactive_ui(), extract_interactive_content(),
+is_keystroke_menu(), parse_menu_options(), extract_command_result(),
 is_prompt_ready(), is_blocking_dialog(), parse_status_line(),
 is_post_turn_status(), strip_pane_chrome(), extract_bash_output().
 """
@@ -83,6 +84,16 @@ UI_PATTERNS: list[UIPattern] = [
             re.compile(r"^\s*Do you want to delete \S"),
         ),
         bottom=(re.compile(r"^\s*Esc to cancel"),),
+    ),
+    UIPattern(
+        # Second stage of /model: picking a different model from the menu opens
+        # this when the conversation is already cached, so the menu closing is
+        # not the end of the switch.  Listed before the numbered permission
+        # menu, whose top marker also matches the "1. Yes" line, so the
+        # explanation above the options survives into the extract.
+        name="ConfirmChoice",
+        top=(re.compile(r"^\s*Switch model\?"),),
+        bottom=(re.compile(r"^\s*2\.\s"),),
     ),
     UIPattern(
         # Permission menu with numbered choices (no "Esc to cancel" line)
@@ -194,6 +205,65 @@ def extract_interactive_content(pane_text: str) -> InteractiveUIContent | None:
 def is_interactive_ui(pane_text: str) -> bool:
     """Check if terminal currently shows an interactive UI."""
     return extract_interactive_content(pane_text) is not None
+
+
+# UI names whose every keystroke is a hotkey. The other UIs take a typed
+# answer — AskUserQuestion has an "Other" field, ExitPlanMode reads free text
+# — so text sent into those still lands.
+KEYSTROKE_MENUS = frozenset({"Settings", "ConfirmChoice"})
+
+
+def is_keystroke_menu(pane_text: str) -> bool:
+    """Check whether the pane shows a menu that consumes typed text.
+
+    ``/model``, ``/usage`` and their siblings draw a selection menu with no
+    text field: letters move or confirm the highlighted row and Enter closes
+    the menu.  A message typed into one disappears without reaching Claude,
+    and its trailing Enter commits whichever row happened to be selected.
+    """
+    content = extract_interactive_content(pane_text)
+    return content is not None and content.name in KEYSTROKE_MENUS
+
+
+# A menu row: optional cursor, the number key that picks it, then the label.
+# The label ends at the two-space gutter before the description column.
+_RE_MENU_ROW = re.compile(r"^\s*(?:❯\s*)?([1-9])\.\s+(\S.*?)(?:\s{2,}|$)")
+
+
+def parse_menu_options(content: str) -> list[tuple[str, str]]:
+    """Read the numbered rows of a selection menu as (key, label) pairs.
+
+    Claude Code's menus take the row number as a single keystroke that both
+    selects and confirms, so these keys let a caller pick a row outright
+    instead of walking to it with arrows.  Rows are returned in screen order;
+    a menu with no numbered rows yields an empty list.
+    """
+    options: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for line in content.split("\n"):
+        m = _RE_MENU_ROW.match(line)
+        if m and m.group(1) not in seen:
+            seen.add(m.group(1))
+            options.append((m.group(1), m.group(2).strip()))
+    return options
+
+
+_RE_COMMAND_RESULT = re.compile(r"^\s*⎿\s+(\S.*)$")
+
+
+def extract_command_result(pane_text: str) -> str | None:
+    """Return the last ``⎿`` result line a slash command printed, if any.
+
+    Closing a menu leaves its outcome ("Set model to Fable 5 …") on this line
+    and nowhere else — it never reaches the transcript, so a caller that wants
+    to report what a menu did has to read it off the pane.
+    """
+    lines = strip_pane_chrome(pane_text.splitlines())
+    for line in reversed(lines):
+        m = _RE_COMMAND_RESULT.match(line)
+        if m:
+            return m.group(1).strip()
+    return None
 
 
 # ── Prompt readiness ─────────────────────────────────────────────────────

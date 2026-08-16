@@ -32,7 +32,7 @@ from typing import Any
 import aiofiles
 
 from .config import config
-from .terminal_parser import is_blocking_dialog, is_prompt_ready
+from .terminal_parser import is_blocking_dialog, is_keystroke_menu, is_prompt_ready
 from .tmux_manager import tmux_manager
 from .transcript_parser import TranscriptParser
 from .utils import atomic_write_json
@@ -910,6 +910,13 @@ class SessionManager:
             return False, (
                 f"{display} is stuck on a dialog I couldn't dismiss — "
                 f"send /screenshot to see it, or /esc to clear it"
+            )
+        pane = await tmux_manager.capture_pane(window.window_id)
+        if pane is not None and is_keystroke_menu(pane):
+            return False, (
+                f"{display} has a menu open — it reads typed text as hotkeys "
+                f"and drops it. Pick a row with the buttons above, or /esc to "
+                f"close it. For a model switch, /model <name> skips the menu."
             )
         success = await tmux_manager.send_keys(window.window_id, text)
         if success:
