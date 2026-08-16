@@ -13,7 +13,7 @@ Functions:
   - safe_send: Send message with formatting, fallback to plain text
 
 Rate limiting is handled globally by AIORateLimiter on the Application.
-RetryAfter exceptions are re-raised so callers (queue worker) can handle them.
+RetryAfter and DeadThread are re-raised so callers (queue worker) can handle them.
 """
 
 import io
@@ -21,7 +21,7 @@ import logging
 from typing import Any
 
 from telegram import Bot, InputMediaPhoto, LinkPreviewOptions, Message
-from telegram.error import RetryAfter
+from telegram.error import BadRequest, RetryAfter
 
 from ..markdown_v2 import convert_markdown
 from ..transcript_parser import TranscriptParser
@@ -45,6 +45,23 @@ def _ensure_formatted(text: str) -> str:
 
 
 PARSE_MODE = "MarkdownV2"
+
+# Telegram's wording when message_thread_id points at a topic that is gone.
+DEAD_THREAD_MESSAGE = "message thread not found"
+
+
+class DeadThread(Exception):
+    """Telegram says the target topic no longer exists.
+
+    Raised rather than logged so the caller drops the binding. It is the same
+    answer reap's editForumTopic probe pays for, arriving free on a normal send.
+    """
+
+
+def _raise_if_dead_thread(exc: Exception) -> None:
+    """Turn Telegram's dead-topic rejection into DeadThread."""
+    if isinstance(exc, BadRequest) and DEAD_THREAD_MESSAGE in str(exc).lower():
+        raise DeadThread(str(exc)) from exc
 
 
 # Disable link previews in all messages to reduce visual noise
@@ -72,7 +89,8 @@ async def send_with_fallback(
         )
     except RetryAfter:
         raise
-    except Exception:
+    except Exception as exc:
+        _raise_if_dead_thread(exc)
         try:
             return await bot.send_message(
                 chat_id=chat_id, text=strip_sentinels(text), **kwargs
@@ -80,6 +98,7 @@ async def send_with_fallback(
         except RetryAfter:
             raise
         except Exception as e:
+            _raise_if_dead_thread(e)
             logger.error(f"Failed to send message to {chat_id}: {e}")
             return None
 
@@ -187,7 +206,8 @@ async def safe_send(
         )
     except RetryAfter:
         raise
-    except Exception:
+    except Exception as exc:
+        _raise_if_dead_thread(exc)
         try:
             await bot.send_message(
                 chat_id=chat_id, text=strip_sentinels(text), **kwargs
@@ -195,4 +215,5 @@ async def safe_send(
         except RetryAfter:
             raise
         except Exception as e:
+            _raise_if_dead_thread(e)
             logger.error(f"Failed to send message to {chat_id}: {e}")

@@ -34,6 +34,7 @@ from ..tmux_manager import tmux_manager
 from .message_sender import (
     NO_LINK_PREVIEW,
     PARSE_MODE,
+    DeadThread,
     send_photo,
     send_with_fallback,
     strip_sentinels,
@@ -245,6 +246,32 @@ async def _process_content_with_retry(
             await asyncio.sleep(retry_secs)
 
 
+async def _drop_dead_thread(
+    bot: Bot, user_id: int, thread_id: int | None, exc: Exception
+) -> None:
+    """Drop a binding Telegram has just reported as unreachable.
+
+    Left bound, the status poller re-sends into the gone topic every second for
+    as long as the window shows a status line, and the rejected calls earn a
+    multi-hour flood ban on the whole chat. The window itself survives unbound,
+    so it stays available in the window picker.
+    """
+    if thread_id is None:
+        logger.error("Dead thread for user %d with no thread_id: %s", user_id, exc)
+        return
+    # Imported here: cleanup imports this module at load time.
+    from .cleanup import clear_topic_state
+
+    window_id = session_manager.unbind_thread(user_id, thread_id)
+    await clear_topic_state(user_id, thread_id, bot)
+    logger.warning(
+        "Unbound thread %d (window %s) for user %d: topic no longer exists",
+        thread_id,
+        window_id,
+        user_id,
+    )
+
+
 async def _message_queue_worker(bot: Bot, user_id: int) -> None:
     """Process message tasks for a user sequentially."""
     queue = _message_queues[user_id]
@@ -310,6 +337,8 @@ async def _message_queue_worker(bot: Bot, user_id: int) -> None:
                         retry_secs,
                     )
                     await asyncio.sleep(retry_secs)
+            except DeadThread as e:
+                await _drop_dead_thread(bot, user_id, task.thread_id, e)
             except Exception as e:
                 logger.error(f"Error processing message task for user {user_id}: {e}")
             finally:
