@@ -88,6 +88,7 @@ def _build_interactive_keyboard(
     window_id: str,
     ui_name: str = "",
     options: list[tuple[str, str]] | None = None,
+    adjustable: bool = False,
 ) -> InlineKeyboardMarkup:
     """Build keyboard for interactive UI navigation.
 
@@ -98,6 +99,11 @@ def _build_interactive_keyboard(
     picks that row in one keystroke, which is the only reliable way to choose
     over Telegram: every arrow tap costs a round trip, and the list wraps, so
     walking to a row lands on the wrong one whenever a tap arrives late.
+    Given those, the navigation pad has nothing left to do, so it gives way to
+    Esc and — where the menu says ←/→ adjusts something — those two keys.
+
+    ``adjustable`` marks a menu carrying a ←/→ setting alongside its rows,
+    such as the effort level under the model list.
     """
     vertical_only = ui_name == "RestoreCheckpoint"
 
@@ -112,6 +118,29 @@ def _build_interactive_keyboard(
                 for key, label in (options or [])[i : i + 2]
             ]
         )
+    if options:
+        controls = [
+            InlineKeyboardButton(
+                "⎋ Esc", callback_data=f"{CB_ASK_ESC}{window_id}"[:64]
+            ),
+            InlineKeyboardButton(
+                "🔄", callback_data=f"{CB_ASK_REFRESH}{window_id}"[:64]
+            ),
+        ]
+        if adjustable:
+            controls.insert(
+                0,
+                InlineKeyboardButton(
+                    "←", callback_data=f"{CB_ASK_LEFT}{window_id}"[:64]
+                ),
+            )
+            controls.append(
+                InlineKeyboardButton(
+                    "→", callback_data=f"{CB_ASK_RIGHT}{window_id}"[:64]
+                )
+            )
+        rows.append(controls)
+        return InlineKeyboardMarkup(rows)
     # Row 1: directional keys
     rows.append(
         [
@@ -206,7 +235,10 @@ async def handle_interactive_ui(
         parse_menu_options(content.content) if content.name in KEYSTROKE_MENUS else []
     )
     keyboard = _build_interactive_keyboard(
-        window_id, ui_name=content.name, options=options
+        window_id,
+        ui_name=content.name,
+        options=options,
+        adjustable="←/→" in content.content,
     )
 
     # Send as plain text (no markdown conversion)

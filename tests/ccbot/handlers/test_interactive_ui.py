@@ -13,6 +13,7 @@ from ccbot.handlers.callback_data import (
     CB_ASK_ENTER,
     CB_ASK_ESC,
     CB_ASK_LEFT,
+    CB_ASK_PICK,
     CB_ASK_RIGHT,
     CB_ASK_SPACE,
     CB_ASK_TAB,
@@ -109,3 +110,29 @@ class TestKeyboardLayoutForSettings:
         assert any(CB_ASK_RIGHT in d for d in all_cb_data if d)
         assert any(CB_ASK_ESC in d for d in all_cb_data if d)
         assert any(CB_ASK_ENTER in d for d in all_cb_data if d)
+
+    def test_parsed_rows_replace_the_nav_pad(self):
+        keyboard = _build_interactive_keyboard(
+            "@5",
+            ui_name="Settings",
+            options=[("1", "Default"), ("3", "Fable ✔")],
+            adjustable=True,
+        )
+        labels = [btn.text for row in keyboard.inline_keyboard for btn in row]
+        assert labels == ["Default", "Fable ✔", "←", "⎋ Esc", "🔄", "→"]
+        picks = [
+            btn.callback_data
+            for row in keyboard.inline_keyboard
+            for btn in row
+            if btn.callback_data.startswith(CB_ASK_PICK)
+        ]
+        assert picks == ["aq:pick:1:@5", "aq:pick:3:@5"]
+
+    def test_arrows_dropped_when_menu_adjusts_nothing(self):
+        keyboard = _build_interactive_keyboard(
+            "@5",
+            ui_name="ConfirmChoice",
+            options=[("1", "Yes"), ("2", "No, go back")],
+        )
+        labels = [btn.text for row in keyboard.inline_keyboard for btn in row]
+        assert labels == ["Yes", "No, go back", "⎋ Esc", "🔄"]
