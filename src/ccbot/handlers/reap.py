@@ -36,25 +36,40 @@ logger = logging.getLogger(__name__)
 # service message we would then have to delete.
 RECENT_ACTIVITY_SECONDS = 120.0
 
+# How long a status line is taken at face value. A turn that dies mid-request
+# leaves the spinner painted in the pane indefinitely, which would otherwise
+# make the window permanently unprobeable.
+STATUS_LINE_TRUST_SECONDS = 600.0
+
 # (user_id, thread_id, name) of probes awaiting their echo. topic_edited_handler
 # deletes the matching service message instead of treating it as a real rename.
 PENDING_ECHOES: set[tuple[int, int, str]] = set()
 
 
+async def _idle_seconds(window_id: str) -> float | None:
+    """Seconds since the window's transcript last grew, or None if unknown."""
+    session = await session_manager.resolve_session_for_window(window_id)
+    if not (session and session.file_path):
+        return None
+    try:
+        return time.time() - Path(session.file_path).stat().st_mtime
+    except OSError:
+        return None
+
+
 async def _is_obviously_alive(window_id: str) -> bool:
     """Check whether a window is mid-turn or was used moments ago."""
+    idle = await _idle_seconds(window_id)
+    if idle is None:
+        return False
+
     pane = await tmux_manager.capture_pane(window_id)
     if pane and parse_status_line(pane):
-        return True  # Claude is working — do not disturb it.
+        # Claude is working — do not disturb it, unless the transcript stopped
+        # growing long ago and the status line is just a stuck spinner.
+        return idle < STATUS_LINE_TRUST_SECONDS
 
-    session = await session_manager.resolve_session_for_window(window_id)
-    if session and session.file_path:
-        try:
-            idle = time.time() - Path(session.file_path).stat().st_mtime
-        except OSError:
-            return False
-        return idle < RECENT_ACTIVITY_SECONDS
-    return False
+    return idle < RECENT_ACTIVITY_SECONDS
 
 
 async def reap_dead_topics(

@@ -1,5 +1,9 @@
 """Tests for reap — killing windows whose Telegram topic is gone."""
 
+import os
+import time
+from types import SimpleNamespace
+
 import pytest
 from telegram.error import BadRequest
 
@@ -182,3 +186,44 @@ class TestConsumeProbeEcho:
         """A rename Zell made must reach the normal sync path."""
         PENDING_ECHOES.add((USER, 22, "alive"))
         assert await consume_probe_echo(None, USER, 22, "a name he chose") is False
+
+
+class TestIsObviouslyAlive:
+    """A status line is only trusted while the transcript is still growing."""
+
+    STATUS_PANE = "✳ Gitifying… (2m 1s · ↓ 6.5k tokens)\n"
+
+    @staticmethod
+    def _setup(monkeypatch, tmp_path, pane: str, age_seconds: float) -> None:
+        transcript = tmp_path / "session.jsonl"
+        transcript.write_text("{}")
+        os.utime(transcript, (time.time(), time.time() - age_seconds))
+
+        async def fake_session(window_id: str):
+            return SimpleNamespace(file_path=str(transcript))
+
+        async def fake_capture(window_id: str) -> str:
+            return pane
+
+        monkeypatch.setattr(
+            reap_mod.session_manager, "resolve_session_for_window", fake_session
+        )
+        monkeypatch.setattr(reap_mod.tmux_manager, "capture_pane", fake_capture)
+
+    @pytest.mark.asyncio
+    async def test_working_window_is_alive(self, mgr, monkeypatch, tmp_path) -> None:
+        self._setup(monkeypatch, tmp_path, self.STATUS_PANE, age_seconds=5)
+        assert await reap_mod._is_obviously_alive("@1") is True
+
+    @pytest.mark.asyncio
+    async def test_stale_spinner_is_not_alive(self, mgr, monkeypatch, tmp_path) -> None:
+        """A turn that dies mid-request leaves its status line painted for hours."""
+        self._setup(monkeypatch, tmp_path, self.STATUS_PANE, age_seconds=4 * 3600)
+        assert await reap_mod._is_obviously_alive("@1") is False
+
+    @pytest.mark.asyncio
+    async def test_recently_used_idle_window_is_alive(
+        self, mgr, monkeypatch, tmp_path
+    ) -> None:
+        self._setup(monkeypatch, tmp_path, "❯ \n", age_seconds=5)
+        assert await reap_mod._is_obviously_alive("@1") is True
