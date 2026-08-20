@@ -157,6 +157,41 @@ class TestExtractInteractiveContent:
         assert result.name == "PermissionPrompt"
         assert "Do you want to proceed?" in result.content
 
+    def test_permission_prompt_keeps_the_preamble(self):
+        """The question sits at the foot of its box — what it asks about is above it."""
+        pane = "\n".join(
+            [
+                "  Ran 3 shell commands",
+                "",
+                "─" * 60,
+                ' Use skill "schedule"?',
+                " Claude may use instructions, code, or files from this Skill.",
+                "",
+                " Do you want to proceed?",
+                " ❯ 1. Yes",
+                "   2. No",
+                "",
+                " Esc to cancel · Tab to amend",
+            ]
+        )
+        result = extract_interactive_content(pane)
+        assert result is not None
+        assert result.name == "PermissionPrompt"
+        assert 'Use skill "schedule"?' in result.content
+        assert "Ran 3 shell commands" not in result.content
+
+    def test_permission_prompt_preamble_is_capped(self):
+        """A preamble with no border in reach is cut short and marked."""
+        pane = "\n".join(
+            ["  scrollback"] * 60
+            + [" Do you want to proceed?", " ❯ 1. Yes", " Esc to cancel"]
+        )
+        result = extract_interactive_content(pane)
+        assert result is not None
+        assert result.content.startswith("…\n")
+        # "…" + 30 preamble lines + the 3 dialog lines
+        assert len(result.content.split("\n")) == 34
+
     def test_restore_checkpoint(self):
         pane = (
             "  Restore the code to a previous state?\n"

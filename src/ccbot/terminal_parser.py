@@ -40,12 +40,26 @@ class UIPattern:
     ``top`` and ``bottom`` are tuples of compiled regexes — any single match
     is sufficient.  This accommodates wording changes across Claude Code
     versions (e.g. a reworded confirmation prompt).
+
+    ``back_to`` extends the region upward: from the ``top`` line, scan up to
+    ``max_back`` lines for the dialog's opening border and start just below
+    it.  A confirmation question sits at the *foot* of its box, so a pattern
+    anchored on the question alone drops the tool name, command, skill
+    description or diff the question is about.  When no ``back_to`` line is
+    within reach the region starts ``max_back`` lines up, marked with ``…``.
     """
 
     name: str  # Descriptive label (not used programmatically)
     top: tuple[re.Pattern[str], ...]
     bottom: tuple[re.Pattern[str], ...]
     min_gap: int = 2  # minimum lines between top and bottom (inclusive)
+    back_to: tuple[re.Pattern[str], ...] = ()  # opens the region above `top`
+    max_back: int = 30  # how far above `top` to look for a `back_to` line
+
+
+# Opening border of a Claude Code dialog box, drawn as a rule across the pane
+# or as the top-left corner of a rounded box.
+_RE_DIALOG_BORDER = re.compile(r"^\s*[╭╰]?─{5,}")
 
 
 # ── UI pattern definitions (order matters — first match wins) ────────────
@@ -84,6 +98,7 @@ UI_PATTERNS: list[UIPattern] = [
             re.compile(r"^\s*Do you want to delete \S"),
         ),
         bottom=(re.compile(r"^\s*Esc to cancel"),),
+        back_to=(_RE_DIALOG_BORDER,),
     ),
     UIPattern(
         # Second stage of /model: picking a different model from the menu opens
@@ -101,6 +116,7 @@ UI_PATTERNS: list[UIPattern] = [
         top=(re.compile(r"^\s*❯\s*1\.\s*Yes"),),
         bottom=(),
         min_gap=2,
+        back_to=(_RE_DIALOG_BORDER,),
     ),
     UIPattern(
         # Bash command approval
@@ -178,8 +194,27 @@ def _try_extract(lines: list[str], pattern: UIPattern) -> InteractiveUIContent |
     if bottom_idx is None or bottom_idx - top_idx < pattern.min_gap:
         return None
 
-    content = "\n".join(lines[top_idx : bottom_idx + 1]).rstrip()
+    start_idx, clipped = _widen_start(lines, top_idx, pattern)
+    body = "\n".join(lines[start_idx : bottom_idx + 1]).rstrip()
+    content = f"…\n{body}" if clipped else body
     return InteractiveUIContent(content=_shorten_separators(content), name=pattern.name)
+
+
+def _widen_start(
+    lines: list[str], top_idx: int, pattern: UIPattern
+) -> tuple[int, bool]:
+    """Move the region's start above ``top_idx`` to cover the dialog's preamble.
+
+    Returns the new start index and whether the preamble was cut short of its
+    opening border.
+    """
+    if not pattern.back_to or top_idx == 0:
+        return top_idx, False
+    floor = max(0, top_idx - pattern.max_back)
+    for i in range(top_idx - 1, floor - 1, -1):
+        if any(p.search(lines[i]) for p in pattern.back_to):
+            return i + 1, False
+    return floor, floor > 0
 
 
 # ── Public API ───────────────────────────────────────────────────────────
