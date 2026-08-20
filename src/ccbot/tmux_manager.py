@@ -445,25 +445,26 @@ class TmuxManager:
         def _create_and_start() -> tuple[bool, str, str, str]:
             session = self.get_or_create_session()
             try:
-                # Create new window
+                cmd = config.claude_command
+                if resume_session_id:
+                    cmd = f"{cmd} --resume {resume_session_id}"
+
+                # Run Claude as the window's own command. Typing it into the
+                # window's shell instead lets any startup prompt that shell
+                # draws — omz's update question, for one — read the keystrokes
+                # as its own answer, and Claude never starts.  The window
+                # closing when Claude exits is what keeps "window exists" and
+                # "Claude is running" the same answer.
                 window = session.new_window(
                     window_name=final_window_name,
                     start_directory=str(path),
+                    window_shell=cmd if start_claude else None,
                 )
 
                 wid = window.window_id or ""
 
                 # Prevent Claude Code from overriding window name
                 window.set_window_option("allow-rename", "off")
-
-                # Start Claude Code if requested
-                if start_claude:
-                    pane = window.active_pane
-                    if pane:
-                        cmd = config.claude_command
-                        if resume_session_id:
-                            cmd = f"{cmd} --resume {resume_session_id}"
-                        pane.send_keys(cmd, enter=True)
 
                 logger.info(
                     "Created window '%s' (id=%s) at %s",
