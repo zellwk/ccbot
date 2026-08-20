@@ -2,6 +2,7 @@
 
 Wraps libtmux to provide async-friendly operations on a single tmux session:
   - list_windows / find_window_by_name: discover Claude Code windows.
+  - live_window_ids: which windows exist, distinguishing "none" from "can't ask".
   - capture_pane: read terminal content (plain or with ANSI colors).
   - send_keys: forward user input or control keys to a window.
   - create_window / kill_window: lifecycle management.
@@ -174,6 +175,34 @@ class TmuxManager:
                 return window
         logger.debug("Window not found by id: %s", window_id)
         return None
+
+    async def live_window_ids(self) -> set[str] | None:
+        """Every window id tmux reports, or None when tmux could not be answered.
+
+        list_windows() reads an unreachable tmux server as a server with no
+        windows, so a missing window there is not evidence the window is gone.
+        Callers about to discard state on that verdict ask here instead.
+        """
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "tmux",
+                "list-windows",
+                "-a",
+                "-F",
+                "#{window_id}",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await proc.communicate()
+        except Exception as e:
+            logger.warning("Could not run tmux list-windows: %s", e)
+            return None
+        if proc.returncode != 0:
+            logger.warning(
+                "tmux list-windows failed: %s", stderr.decode("utf-8").strip()
+            )
+            return None
+        return set(stdout.decode("utf-8").split())
 
     async def capture_pane(self, window_id: str, with_ansi: bool = False) -> str | None:
         """Capture the visible text content of a window's active pane.

@@ -120,11 +120,13 @@ async def status_poll_loop(bot: Bot) -> None:
     logger.info("Status polling started (interval: %ss)", STATUS_POLL_INTERVAL)
     while True:
         try:
+            # One authoritative read per cycle. None means tmux could not be
+            # answered, and no binding can be called stale on that.
+            live_ids = await tmux_manager.live_window_ids()
             for user_id, thread_id, wid in list(session_manager.iter_thread_bindings()):
                 try:
                     # Clean up stale bindings (window no longer exists)
-                    w = await tmux_manager.find_window_by_id(wid)
-                    if not w:
+                    if live_ids is not None and wid not in live_ids:
                         session_manager.unbind_thread(user_id, thread_id)
                         await clear_topic_state(user_id, thread_id, bot)
                         logger.info(
