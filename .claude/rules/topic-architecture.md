@@ -1,6 +1,8 @@
 # Topic-Only Architecture
 
-The bot operates exclusively in Telegram Forum (topics) mode. There is **no** `active_sessions` mapping, **no** `/list` command, **no** General topic routing, and **no** backward-compatibility logic for older non-topic modes. Every code path assumes named topics.
+The bot operates exclusively in Telegram Forum (topics) mode. There is **no** `active_sessions` mapping, **no** `/list` command, and **no** backward-compatibility logic for older non-topic modes. Every code path routes through a topic.
+
+A message that arrives outside any topic — the main chat view, which is where another app's share sheet lands — has no window to route to. `_open_topic_for_main_chat` calls `createForumTopic` (bots may create topics in private chats as of Bot API 9.3), mirrors the message in with `copyMessage`, and the handler continues against the new thread_id. Replies anchor on the bot's message in the new topic, not on the original in the main chat.
 
 ## 1 Topic = 1 Window = 1 Session
 
@@ -59,6 +61,8 @@ SessionMonitor reads new message (session_id = "uuid-xxx")
 ```
 
 **New topic flow**: First message in an unbound topic → directory browser → select directory → session picker (if existing sessions found) or create window → bind topic → forward pending message.
+
+`_resolve_window_for_thread` is the one entry point for that flow. Text, photo and voice all call it, so any message type starts a session — the window picker and the auto-create fallback behave the same whichever arrives first. Photos download and voice transcribes before the call, so the pending message handed to the new session carries the image path or the transcript.
 
 **Resume session flow**: When selecting a directory with existing Claude sessions, a session picker UI is shown. Choosing a session runs `claude --resume <session_id>`. Note: messages continue writing to the original JSONL file, and current Claude Code reports the original session_id in the SessionStart hook (`source: "resume"`), so state stays consistent. As a safety net for hook timeout or older Claude Code versions that report a different session_id, the bot forces both window_state and session_map.json (via `override_session_map_entry`, under the hook's flock) to the resumed session_id.
 

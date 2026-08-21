@@ -10,6 +10,8 @@ Core responsibilities:
     interactive UI navigation, screenshot refresh.
   - Topic-based routing: each named topic binds to one tmux window.
     Unbound topics trigger the directory browser to create a new session.
+    A message sent outside any topic opens one and continues there
+    (_open_topic_for_main_chat).
   - Photo handling: photos sent by user are downloaded and forwarded
     to Claude Code as file paths (photo_handler).
   - Voice handling: voice messages are transcribed via OpenAI API and
@@ -37,6 +39,7 @@ import io
 import logging
 import time
 from pathlib import Path
+from typing import Any
 
 from telegram import (
     Bot,
@@ -190,6 +193,127 @@ def _get_thread_id(update: Update) -> int | None:
     if tid is None or tid == 1:
         return None
     return tid
+
+
+# Placeholder name for a bot-opened topic. topic_namer keys auto-renaming off
+# the window's auto_named flag, not the topic name, so this gets replaced once
+# the session has enough turns.
+NEW_TOPIC_NAME = "New chat"
+
+
+async def _open_topic_for_main_chat(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, user: Any
+) -> tuple[int, Any] | None:
+    """Open a topic for a message sent outside one, and mirror the message into it.
+
+    Sharing from another app (the iOS share sheet, say) lands in the main chat,
+    which has no window to route to. Bots may create topics in private chats as
+    of Bot API 9.3. Returns (thread_id, message to anchor replies on), or None
+    if the topic could not be created.
+    """
+    msg = update.message
+    if msg is None:
+        return None
+    chat_id = msg.chat.id
+    try:
+        topic = await context.bot.create_forum_topic(
+            chat_id=chat_id, name=NEW_TOPIC_NAME
+        )
+    except Exception as e:
+        logger.error("create_forum_topic failed (user=%d): %s", user.id, e)
+        return None
+
+    tid = topic.message_thread_id
+    logger.info("Main-chat message: opened topic %d (user=%d)", tid, user.id)
+
+    try:
+        await context.bot.copy_message(
+            chat_id=chat_id,
+            from_chat_id=chat_id,
+            message_id=msg.message_id,
+            message_thread_id=tid,
+        )
+    except Exception as e:
+        logger.warning("Mirroring message into topic %d failed: %s", tid, e)
+
+    anchor = await safe_send(
+        context.bot,
+        chat_id,
+        "Opened a topic for this.",
+        message_thread_id=tid,
+    )
+    return tid, anchor or msg
+
+
+async def _resolve_window_for_thread(
+    context: ContextTypes.DEFAULT_TYPE,
+    user: Any,
+    thread_id: int,
+    pending_text: str,
+    reply_to: Any,
+) -> str | None:
+    """Return the window bound to this topic, or start one and return None.
+
+    None means the caller is done: the topic is either waiting on a pick from
+    the window picker, or a fresh session now holds ``pending_text``. Shared by
+    the text, photo and voice handlers so all three enter a topic the same way.
+    """
+    wid = session_manager.get_window_for_thread(user.id, thread_id)
+    if wid is not None:
+        return wid
+
+    all_windows = await tmux_manager.list_windows()
+    bound_ids = {w for _, _, w in session_manager.iter_thread_bindings()}
+    unbound = [
+        (w.window_id, w.window_name, w.cwd)
+        for w in all_windows
+        if w.window_id not in bound_ids
+    ]
+    logger.debug(
+        "Window picker check: all=%s, bound=%s, unbound=%s",
+        [w.window_name for w in all_windows],
+        bound_ids,
+        [name for _, name, _ in unbound],
+    )
+
+    if context.user_data is not None:
+        context.user_data["_pending_thread_id"] = thread_id
+        context.user_data["_pending_thread_text"] = pending_text
+
+    if unbound:
+        logger.info(
+            "Unbound topic: showing window picker (%d unbound windows, user=%d, thread=%d)",
+            len(unbound),
+            user.id,
+            thread_id,
+        )
+        msg_text, keyboard, win_ids = build_window_picker(unbound)
+        if context.user_data is not None:
+            context.user_data[STATE_KEY] = STATE_SELECTING_WINDOW
+            context.user_data[UNBOUND_WINDOWS_KEY] = win_ids
+        await safe_reply(reply_to, msg_text, reply_markup=keyboard)
+        return None
+
+    # LOCAL PATCH: no directory browser, no resume picker. An unbound topic
+    # starts a fresh session in ccbot's own cwd. Upstream paginates a directory
+    # browser, then offers a picker whose labels are each session's first user
+    # message — unreadable for bridge sessions.
+    start_path = str(Path.cwd())
+    logger.info(
+        "Unbound topic: auto-creating session at %s (user=%d, thread=%d)",
+        start_path,
+        user.id,
+        thread_id,
+    )
+    await _create_and_bind_window(
+        None,
+        context,
+        user,
+        start_path,
+        thread_id,
+        origin_message=reply_to,
+    )
+    return None
 
 
 # --- Command handlers ---
@@ -702,35 +826,20 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     chat = update.message.chat
     thread_id = _get_thread_id(update)
-    if chat.type in ("group", "supergroup") and thread_id is not None:
-        session_manager.set_group_chat_id(user.id, thread_id, chat.id)
+    reply_to: Any = update.message
 
-    # Must be in a named topic
     if thread_id is None:
-        await safe_reply(
-            update.message,
-            "❌ Please use a named topic. Create a new topic to start a session.",
-        )
-        return
+        opened = await _open_topic_for_main_chat(update, context, user)
+        if opened is None:
+            await safe_reply(
+                update.message,
+                "❌ Couldn't open a topic for this. Create one and send it there.",
+            )
+            return
+        thread_id, reply_to = opened
 
-    wid = session_manager.get_window_for_thread(user.id, thread_id)
-    if wid is None:
-        await safe_reply(
-            update.message,
-            "❌ No session bound to this topic. Send a text message first to create one.",
-        )
-        return
-
-    w = await tmux_manager.find_window_by_id(wid)
-    if not w:
-        display = session_manager.get_display_name(wid)
-        session_manager.unbind_thread(user.id, thread_id)
-        await safe_reply(
-            update.message,
-            f"❌ Window '{display}' no longer exists. Binding removed.\n"
-            "Send a message to start a new session.",
-        )
-        return
+    if chat.type in ("group", "supergroup"):
+        session_manager.set_group_chat_id(user.id, thread_id, chat.id)
 
     # Download the highest-resolution photo
     photo = update.message.photo[-1]
@@ -748,6 +857,23 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     else:
         text_to_send = f"(image attached: {file_path})"
 
+    wid = await _resolve_window_for_thread(
+        context, user, thread_id, text_to_send, reply_to
+    )
+    if wid is None:
+        return
+
+    w = await tmux_manager.find_window_by_id(wid)
+    if not w:
+        display = session_manager.get_display_name(wid)
+        session_manager.unbind_thread(user.id, thread_id)
+        await safe_reply(
+            reply_to,
+            f"❌ Window '{display}' no longer exists. Binding removed.\n"
+            "Send a message to start a new session.",
+        )
+        return
+
     try:
         await update.message.chat.send_action(ChatAction.TYPING)
     except Exception as e:
@@ -756,13 +882,13 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     success, message = await session_manager.send_to_window(wid, text_to_send)
     if not success:
-        await safe_reply(update.message, f"❌ {message}")
+        await safe_reply(reply_to, f"❌ {message}")
         return
 
     # Confirm to user — same switch as the user-message echo, since this is
     # only a restatement of what they just did. Failures above still report.
     if config.show_user_messages:
-        await safe_reply(update.message, "📷 Image sent to Claude Code.")
+        await safe_reply(reply_to, "📷 Image sent to Claude Code.")
 
 
 async def voice_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -786,34 +912,20 @@ async def voice_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     chat = update.message.chat
     thread_id = _get_thread_id(update)
-    if chat.type in ("group", "supergroup") and thread_id is not None:
-        session_manager.set_group_chat_id(user.id, thread_id, chat.id)
+    reply_to: Any = update.message
 
     if thread_id is None:
-        await safe_reply(
-            update.message,
-            "❌ Please use a named topic. Create a new topic to start a session.",
-        )
-        return
+        opened = await _open_topic_for_main_chat(update, context, user)
+        if opened is None:
+            await safe_reply(
+                update.message,
+                "❌ Couldn't open a topic for this. Create one and send it there.",
+            )
+            return
+        thread_id, reply_to = opened
 
-    wid = session_manager.get_window_for_thread(user.id, thread_id)
-    if wid is None:
-        await safe_reply(
-            update.message,
-            "❌ No session bound to this topic. Send a text message first to create one.",
-        )
-        return
-
-    w = await tmux_manager.find_window_by_id(wid)
-    if not w:
-        display = session_manager.get_display_name(wid)
-        session_manager.unbind_thread(user.id, thread_id)
-        await safe_reply(
-            update.message,
-            f"❌ Window '{display}' no longer exists. Binding removed.\n"
-            "Send a message to start a new session.",
-        )
-        return
+    if chat.type in ("group", "supergroup"):
+        session_manager.set_group_chat_id(user.id, thread_id, chat.id)
 
     # Download voice as in-memory bytes
     voice_file = await update.message.voice.get_file()
@@ -823,11 +935,26 @@ async def voice_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     try:
         text = await transcribe_voice(ogg_data)
     except ValueError as e:
-        await safe_reply(update.message, f"⚠ {e}")
+        await safe_reply(reply_to, f"⚠ {e}")
         return
     except Exception as e:
         logger.error("Voice transcription failed: %s", e)
-        await safe_reply(update.message, f"⚠ Transcription failed: {e}")
+        await safe_reply(reply_to, f"⚠ Transcription failed: {e}")
+        return
+
+    wid = await _resolve_window_for_thread(context, user, thread_id, text, reply_to)
+    if wid is None:
+        return
+
+    w = await tmux_manager.find_window_by_id(wid)
+    if not w:
+        display = session_manager.get_display_name(wid)
+        session_manager.unbind_thread(user.id, thread_id)
+        await safe_reply(
+            reply_to,
+            f"❌ Window '{display}' no longer exists. Binding removed.\n"
+            "Send a message to start a new session.",
+        )
         return
 
     try:
@@ -838,10 +965,10 @@ async def voice_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     success, message = await session_manager.send_to_window(wid, text)
     if not success:
-        await safe_reply(update.message, f"❌ {message}")
+        await safe_reply(reply_to, f"❌ {message}")
         return
 
-    await safe_reply(update.message, f'🎤 "{text}"')
+    await safe_reply(reply_to, f'🎤 "{text}"')
 
 
 # Active bash capture tasks: (user_id, thread_id) → asyncio.Task
@@ -948,13 +1075,6 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     thread_id = _get_thread_id(update)
 
-    # Capture group chat_id for supergroup forum topic routing.
-    # Required: Telegram Bot API needs group chat_id (not user_id) to send
-    # messages with message_thread_id. Do NOT remove — see session.py docs.
-    chat = update.effective_chat
-    if chat and chat.type in ("group", "supergroup"):
-        session_manager.set_group_chat_id(user.id, thread_id, chat.id)
-
     text = update.message.text
 
     # Ignore text in window picker mode (only for the same thread)
@@ -1006,70 +1126,26 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         context.user_data.pop("_pending_thread_text", None)
         context.user_data.pop("_selected_path", None)
 
-    # Must be in a named topic
+    reply_to: Any = update.message
     if thread_id is None:
-        await safe_reply(
-            update.message,
-            "❌ Please use a named topic. Create a new topic to start a session.",
-        )
-        return
-
-    wid = session_manager.get_window_for_thread(user.id, thread_id)
-    if wid is None:
-        # Unbound topic — check for unbound windows first
-        all_windows = await tmux_manager.list_windows()
-        bound_ids = {wid for _, _, wid in session_manager.iter_thread_bindings()}
-        unbound = [
-            (w.window_id, w.window_name, w.cwd)
-            for w in all_windows
-            if w.window_id not in bound_ids
-        ]
-        logger.debug(
-            "Window picker check: all=%s, bound=%s, unbound=%s",
-            [w.window_name for w in all_windows],
-            bound_ids,
-            [name for _, name, _ in unbound],
-        )
-
-        if unbound:
-            # Show window picker
-            logger.info(
-                "Unbound topic: showing window picker (%d unbound windows, user=%d, thread=%d)",
-                len(unbound),
-                user.id,
-                thread_id,
+        opened = await _open_topic_for_main_chat(update, context, user)
+        if opened is None:
+            await safe_reply(
+                update.message,
+                "❌ Couldn't open a topic for this. Create one and send it there.",
             )
-            msg_text, keyboard, win_ids = build_window_picker(unbound)
-            if context.user_data is not None:
-                context.user_data[STATE_KEY] = STATE_SELECTING_WINDOW
-                context.user_data[UNBOUND_WINDOWS_KEY] = win_ids
-                context.user_data["_pending_thread_id"] = thread_id
-                context.user_data["_pending_thread_text"] = text
-            await safe_reply(update.message, msg_text, reply_markup=keyboard)
             return
+        thread_id, reply_to = opened
 
-        # LOCAL PATCH: no directory browser, no resume picker. An unbound
-        # topic starts a fresh session in ccbot's own cwd. Upstream paginates a
-        # directory browser, then offers a picker whose labels are each
-        # session's first user message — unreadable for bridge sessions.
-        start_path = str(Path.cwd())
-        logger.info(
-            "Unbound topic: auto-creating session at %s (user=%d, thread=%d)",
-            start_path,
-            user.id,
-            thread_id,
-        )
-        if context.user_data is not None:
-            context.user_data["_pending_thread_id"] = thread_id
-            context.user_data["_pending_thread_text"] = text
-        await _create_and_bind_window(
-            None,
-            context,
-            user,
-            start_path,
-            thread_id,
-            origin_message=update.message,
-        )
+    # Capture group chat_id for supergroup forum topic routing.
+    # Required: Telegram Bot API needs group chat_id (not user_id) to send
+    # messages with message_thread_id. Do NOT remove — see session.py docs.
+    chat = update.effective_chat
+    if chat and chat.type in ("group", "supergroup"):
+        session_manager.set_group_chat_id(user.id, thread_id, chat.id)
+
+    wid = await _resolve_window_for_thread(context, user, thread_id, text, reply_to)
+    if wid is None:
         return
 
     # Bound topic — forward to bound window
@@ -1130,7 +1206,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     success, message = await session_manager.send_to_window(wid, text)
     if not success:
-        await safe_reply(update.message, f"❌ {message}")
+        await safe_reply(reply_to, f"❌ {message}")
         return
 
     # Name the topic once the thread has enough turns to have a direction
