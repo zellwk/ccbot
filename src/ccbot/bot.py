@@ -104,14 +104,14 @@ from .handlers.directory_browser import (
     UNBOUND_WINDOWS_KEY,
     build_directory_browser,
     build_session_picker,
-    build_window_picker,
     clear_browse_state,
     clear_session_picker_state,
     clear_window_picker_state,
 )
 from .handlers.cleanup import clear_topic_state
 from .handlers.history import send_history
-from .handlers.reap import consume_probe_echo, reap_dead_topics
+from .handlers.reap import reap_dead_topics
+from .rename_echo import consume_rename_echo
 from .handlers.interactive_ui import (
     INTERACTIVE_TOOL_NAMES,
     clear_interactive_mode,
@@ -262,42 +262,15 @@ async def _resolve_window_for_thread(
     if wid is not None:
         return wid
 
-    all_windows = await tmux_manager.list_windows()
-    bound_ids = {w for _, _, w in session_manager.iter_thread_bindings()}
-    unbound = [
-        (w.window_id, w.window_name, w.cwd)
-        for w in all_windows
-        if w.window_id not in bound_ids
-    ]
-    logger.debug(
-        "Window picker check: all=%s, bound=%s, unbound=%s",
-        [w.window_name for w in all_windows],
-        bound_ids,
-        [name for _, name, _ in unbound],
-    )
-
     if context.user_data is not None:
         context.user_data["_pending_thread_id"] = thread_id
         context.user_data["_pending_thread_text"] = pending_text
 
-    if unbound:
-        logger.info(
-            "Unbound topic: showing window picker (%d unbound windows, user=%d, thread=%d)",
-            len(unbound),
-            user.id,
-            thread_id,
-        )
-        msg_text, keyboard, win_ids = build_window_picker(unbound)
-        if context.user_data is not None:
-            context.user_data[STATE_KEY] = STATE_SELECTING_WINDOW
-            context.user_data[UNBOUND_WINDOWS_KEY] = win_ids
-        await safe_reply(reply_to, msg_text, reply_markup=keyboard)
-        return None
-
-    # LOCAL PATCH: no directory browser, no resume picker. An unbound topic
-    # starts a fresh session in ccbot's own cwd. Upstream paginates a directory
-    # browser, then offers a picker whose labels are each session's first user
-    # message — unreadable for bridge sessions.
+    # LOCAL PATCH: no window picker, no directory browser, no resume picker. An
+    # unbound topic starts a fresh session in ccbot's own cwd. Upstream offers
+    # any window with no topic binding, paginates a directory browser, then
+    # offers a picker whose labels are each session's first user message —
+    # unreadable for bridge sessions. /resume is the way back to an earlier one.
     start_path = str(Path.cwd())
     logger.info(
         "Unbound topic: auto-creating session at %s (user=%d, thread=%d)",
@@ -410,12 +383,14 @@ async def unbind_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     display = session_manager.get_display_name(wid)
     session_manager.unbind_thread(user.id, thread_id)
     await clear_topic_state(user.id, thread_id, context.bot, context.user_data)
+    # LOCAL PATCH: kill the window. reap only sweeps windows that still have a
+    # binding, so one left running here could never be reached or cleaned up.
+    await tmux_manager.kill_window(wid)
 
     await safe_reply(
         update.message,
         f"✅ Topic unbound from window '{display}'.\n"
-        "The Claude session is still running in tmux.\n"
-        "Send a message to bind to a new session.",
+        "Send a message to start a fresh session, or /resume to reopen an earlier one.",
     )
 
 
@@ -681,10 +656,6 @@ async def topic_edited_handler(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
     """Handle topic rename — sync new name to tmux window and internal state."""
-    user = update.effective_user
-    if not user or not is_user_allowed(user.id):
-        return
-
     msg = update.message
     if not msg or not msg.forum_topic_edited:
         return
@@ -698,17 +669,22 @@ async def topic_edited_handler(
     if thread_id is None:
         return
 
-    # A liveness probe re-sends the name the topic already has. Telegram posts
-    # a service message anyway, so delete it rather than show Zell a rename
-    # that never happened.
-    if await consume_probe_echo(context.bot, user.id, thread_id, new_name):
+    # A rename ccbot made itself — a liveness probe re-sending the name a topic
+    # already has, or an auto-name. Telegram posts a service message anyway, so
+    # delete it rather than show a rename nobody made. The service message comes
+    # from the bot, so this runs before the allowed-user gate.
+    if consume_rename_echo(msg.chat_id, thread_id, new_name):
         try:
             await context.bot.delete_message(
-                chat_id=session_manager.resolve_chat_id(user.id, thread_id),
+                chat_id=msg.chat_id,
                 message_id=msg.message_id,
             )
         except Exception as e:  # noqa: BLE001 - a stray notice is not fatal
-            logger.debug("Could not delete probe echo: %s", e)
+            logger.debug("Could not delete rename echo: %s", e)
+        return
+
+    user = update.effective_user
+    if not user or not is_user_allowed(user.id):
         return
 
     wid = session_manager.get_window_for_thread(user.id, thread_id)
