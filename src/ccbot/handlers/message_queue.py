@@ -370,6 +370,7 @@ async def _send_task_images(bot: Bot, chat_id: int, task: MessageTask) -> None:
         bot,
         chat_id,
         task.image_data,
+        disable_notification=True,
         **_send_kwargs(task.thread_id),  # type: ignore[arg-type]
     )
 
@@ -422,29 +423,38 @@ async def _process_content_task(bot: Bot, user_id: int, task: MessageTask) -> No
                     # Fall through to send as new message
 
     # 2. Send content messages, converting status message to first content part
+    # Only the last part of Claude's reply notifies. Status lines, tool traffic
+    # and earlier parts of a long reply arrive silently.
+    notify_index = len(task.parts) - 1 if task.content_type == "text" else -1
     first_part = True
     last_msg_id: int | None = None
-    for part in task.parts:
-        sent = None
+    for index, part in enumerate(task.parts):
+        notify = index == notify_index
 
-        # For first part, try to convert status message to content (edit instead of delete)
         if first_part:
             first_part = False
-            converted_msg_id = await _convert_status_to_content(
-                bot,
-                user_id,
-                tid,
-                wid,
-                part,
-            )
-            if converted_msg_id is not None:
-                last_msg_id = converted_msg_id
-                continue
+            if notify:
+                # Editing the status message in place never notifies, so the
+                # finished reply needs a message of its own.
+                await _do_clear_status_message(bot, user_id, tid)
+            else:
+                # Convert status message to content (edit instead of delete)
+                converted_msg_id = await _convert_status_to_content(
+                    bot,
+                    user_id,
+                    tid,
+                    wid,
+                    part,
+                )
+                if converted_msg_id is not None:
+                    last_msg_id = converted_msg_id
+                    continue
 
         sent = await send_with_fallback(
             bot,
             chat_id,
             part,
+            disable_notification=not notify,
             **_send_kwargs(task.thread_id),  # type: ignore[arg-type]
         )
 
@@ -638,6 +648,7 @@ async def _do_send_status_message(
         bot,
         chat_id,
         text,
+        disable_notification=True,
         **_send_kwargs(thread_id),  # type: ignore[arg-type]
     )
     if sent:
