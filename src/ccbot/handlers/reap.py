@@ -10,7 +10,7 @@ The one call that answers truthfully is ``editForumTopic`` with a name. On a
 dead thread it fails with ``TOPIC_ID_INVALID`` and posts nothing, because
 there is no topic to post into. On a live thread it succeeds and posts a
 rename service message — so the probe re-sends the name the topic already
-has, and deletes the echo when it arrives (see PENDING_ECHOES).
+has, and deletes the echo when it arrives (see ``rename_echo``).
 
 Probing runs when a new topic is created, which is the only moment the
 window population grows. Idle time decides who is worth asking about, never
@@ -25,6 +25,7 @@ from pathlib import Path
 from telegram import Bot
 from telegram.error import BadRequest
 
+from ..rename_echo import expect_rename_echo
 from ..session import session_manager
 from ..terminal_parser import parse_status_line
 from ..tmux_manager import tmux_manager
@@ -40,10 +41,6 @@ RECENT_ACTIVITY_SECONDS = 120.0
 # leaves the spinner painted in the pane indefinitely, which would otherwise
 # make the window permanently unprobeable.
 STATUS_LINE_TRUST_SECONDS = 600.0
-
-# (user_id, thread_id, name) of probes awaiting their echo. topic_edited_handler
-# deletes the matching service message instead of treating it as a real rename.
-PENDING_ECHOES: set[tuple[int, int, str]] = set()
 
 
 async def _idle_seconds(window_id: str) -> float | None:
@@ -89,9 +86,10 @@ async def reap_dead_topics(
         if await _is_obviously_alive(wid):
             continue
 
+        chat_id = session_manager.resolve_chat_id(uid, thread_id)
         try:
             await bot.edit_forum_topic(
-                chat_id=session_manager.resolve_chat_id(uid, thread_id),
+                chat_id=chat_id,
                 message_thread_id=thread_id,
                 name=name,
             )
@@ -118,19 +116,6 @@ async def reap_dead_topics(
 
         # Alive. The rename echo is on its way; mark it so it gets deleted
         # rather than shown.
-        PENDING_ECHOES.add((uid, thread_id, name))
+        expect_rename_echo(chat_id, thread_id, name)
 
     return reaped
-
-
-async def consume_probe_echo(bot: Bot, user_id: int, thread_id: int, name: str) -> bool:
-    """Delete a service message this module's probe caused.
-
-    Returns True when the edit was our own probe and has been handled, so the
-    caller skips the real rename path.
-    """
-    key = (user_id, thread_id, name)
-    if key not in PENDING_ECHOES:
-        return False
-    PENDING_ECHOES.discard(key)
-    return True

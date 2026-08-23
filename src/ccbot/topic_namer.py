@@ -24,6 +24,7 @@ import httpx
 from telegram import Bot
 
 from .config import config
+from .rename_echo import expect_rename_echo
 from .session import session_manager
 from .token_usage import find_transcript
 
@@ -191,6 +192,7 @@ async def maybe_autoname(
         await bot.edit_forum_topic(
             chat_id=chat_id, message_thread_id=thread_id, name=title
         )
+        expect_rename_echo(chat_id, thread_id, title)
         session_manager.mark_auto_named(window_id, True)
         # Keep the tmux window in step. The topic_edited service message does
         # this too, but only if Telegram echoes the bot's own edit back.
