@@ -1,10 +1,9 @@
 """Topic renames this bot made itself, whose service message is noise.
 
 Telegram posts a "changed the topic name" service message for every
-``editForumTopic`` call, including ccbot's own — a liveness probe re-sending
-the name a topic already has, and an auto-name landing on a new topic.
-Registering the rename here lets the topic-edited handler delete the echo
-instead of showing a rename nobody made.
+``editForumTopic`` call, including ccbot's own — an auto-name landing on a
+topic that has said enough to be titled. Registering the rename here lets the
+topic-edited handler delete the echo instead of showing a rename nobody made.
 """
 
 # (chat_id, thread_id, name) of renames awaiting their service message.

@@ -53,8 +53,9 @@ DEAD_THREAD_MESSAGE = "message thread not found"
 class DeadThread(Exception):
     """Telegram says the target topic no longer exists.
 
-    Raised rather than logged so the caller drops the binding. It is the same
-    answer reap's editForumTopic probe pays for, arriving free on a normal send.
+    Raised rather than logged so the caller drops the binding. This is the only
+    signal Telegram gives that a topic is gone — it says nothing when one is
+    deleted, so the answer only arrives on the next send.
     """
 
 

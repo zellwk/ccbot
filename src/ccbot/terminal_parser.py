@@ -419,7 +419,7 @@ def is_post_turn_status(status_line: str | None) -> bool:
     A spinner normally means a reply is still coming. During a post-turn hook
     it means the reply already arrived and Claude is finishing up, so callers
     that ask "is more content coming?" must treat this as no. Liveness checks
-    such as reap want the opposite and should keep using parse_status_line.
+    want the opposite and should keep using parse_status_line.
     """
     return bool(status_line and _RE_POST_TURN_HOOK.search(status_line))
 

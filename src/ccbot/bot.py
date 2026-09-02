@@ -110,7 +110,6 @@ from .handlers.directory_browser import (
 )
 from .handlers.cleanup import clear_topic_state
 from .handlers.history import send_history
-from .handlers.reap import reap_dead_topics
 from .rename_echo import consume_rename_echo
 from .handlers.interactive_ui import (
     INTERACTIVE_TOOL_NAMES,
@@ -139,6 +138,7 @@ from .handlers.message_sender import (
 from .markdown_v2 import convert_markdown
 from .handlers.response_builder import build_response_parts
 from .handlers.status_polling import status_poll_loop
+from .scheduler import scheduled_jobs_loop
 from .screenshot import text_to_image
 from .session import session_manager
 from .token_usage import read_usage
@@ -161,6 +161,9 @@ session_monitor: SessionMonitor | None = None
 
 # Status polling task
 _status_poll_task: asyncio.Task | None = None
+
+# Scheduled jobs task
+_scheduled_jobs_task: asyncio.Task | None = None
 
 # Claude Code commands shown in bot menu (forwarded via tmux)
 CC_COMMANDS: dict[str, str] = {
@@ -383,8 +386,8 @@ async def unbind_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     display = session_manager.get_display_name(wid)
     session_manager.unbind_thread(user.id, thread_id)
     await clear_topic_state(user.id, thread_id, context.bot, context.user_data)
-    # LOCAL PATCH: kill the window. reap only sweeps windows that still have a
-    # binding, so one left running here could never be reached or cleaned up.
+    # LOCAL PATCH: kill the window. Nothing else cleans up an unbound window,
+    # so one left running here could never be reached again.
     await tmux_manager.kill_window(wid)
 
     await safe_reply(
@@ -634,24 +637,6 @@ async def topic_closed_handler(
         )
 
 
-async def topic_created_handler(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> None:
-    """A new topic is the one moment the window population grows.
-
-    Telegram never says when a topic dies, so this is where the dead ones get
-    found — before the new window is added to them.
-    """
-    user = update.effective_user
-    if not user or not is_user_allowed(user.id):
-        return
-
-    reaped = await reap_dead_topics(
-        context.bot, user.id, skip_thread=_get_thread_id(update)
-    )
-    logger.info("New topic: reap swept, %d window(s) had no topic left", reaped)
-
-
 async def topic_edited_handler(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
@@ -669,10 +654,10 @@ async def topic_edited_handler(
     if thread_id is None:
         return
 
-    # A rename ccbot made itself — a liveness probe re-sending the name a topic
-    # already has, or an auto-name. Telegram posts a service message anyway, so
-    # delete it rather than show a rename nobody made. The service message comes
-    # from the bot, so this runs before the allowed-user gate.
+    # A rename ccbot made itself — an auto-name. Telegram posts a service
+    # message anyway, so delete it rather than show a rename nobody made. The
+    # service message comes from the bot, so this runs before the allowed-user
+    # gate.
     if consume_rename_echo(msg.chat_id, thread_id, new_name):
         try:
             await context.bot.delete_message(
@@ -2028,7 +2013,7 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
 
 
 async def post_init(application: Application) -> None:
-    global session_monitor, _status_poll_task
+    global session_monitor, _status_poll_task, _scheduled_jobs_task
 
     # Clear every scope we might have written before, plus stale scopes left by
     # earlier setups (BotFather, older versions).  A narrower scope beats the
@@ -2103,9 +2088,22 @@ async def post_init(application: Application) -> None:
     _status_poll_task = asyncio.create_task(status_poll_loop(application.bot))
     logger.info("Status polling task started")
 
+    _scheduled_jobs_task = asyncio.create_task(scheduled_jobs_loop(application.bot))
+    logger.info("Scheduled jobs task started")
+
 
 async def post_shutdown(application: Application) -> None:
-    global _status_poll_task
+    global _status_poll_task, _scheduled_jobs_task
+
+    # Stop scheduled jobs
+    if _scheduled_jobs_task:
+        _scheduled_jobs_task.cancel()
+        try:
+            await _scheduled_jobs_task
+        except asyncio.CancelledError:
+            pass
+        _scheduled_jobs_task = None
+        logger.info("Scheduled jobs stopped")
 
     # Stop status polling
     if _status_poll_task:
@@ -2151,13 +2149,6 @@ def create_bot() -> Application:
         MessageHandler(
             filters.StatusUpdate.FORUM_TOPIC_CLOSED,
             topic_closed_handler,
-        )
-    )
-    # Topic created event — reap windows whose topic is gone before adding one
-    application.add_handler(
-        MessageHandler(
-            filters.StatusUpdate.FORUM_TOPIC_CREATED,
-            topic_created_handler,
         )
     )
     # Topic edited event — sync renamed topic to tmux window
