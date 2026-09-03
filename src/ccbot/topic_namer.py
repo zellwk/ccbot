@@ -137,6 +137,9 @@ async def generate_title(digest: str) -> str | None:
         "model": config.autoname_model,
         "prompt": _PROMPT.format(digest=digest),
         "stream": False,
+        # Thinking models spend the whole num_predict budget reasoning and
+        # return an empty response. Ignored by models that don't think.
+        "think": False,
         "options": {"temperature": 0.2, "num_predict": 32},
     }
     try:
