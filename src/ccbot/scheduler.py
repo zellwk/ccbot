@@ -9,10 +9,13 @@ tick — late beats never for a morning report.
 Job shape::
 
     {"name": "email-triage", "at": "08:00", "days": [0,1,2,3,4,5,6],
-     "cwd": "/Users/zellwk/projects", "topic": "Email triage",
-     "prompt": "triage emails"}
+     "machines": ["headless"], "cwd": "/Users/zellwk/projects",
+     "topic": "Email triage", "prompt": "triage emails"}
 
 ``days`` uses Python weekdays, Monday 0. Omit it for every day.
+
+``machines`` lists the roles this job runs on, matched against ``~/.claude/.machine``
+— ``headless`` on the Mac mini, ``main`` on the laptop. Omit it to run everywhere.
 """
 
 import asyncio
@@ -68,14 +71,25 @@ def _load_jobs() -> list[dict[str, Any]]:
     return json.loads(path.read_text())
 
 
+def _this_machine() -> str:
+    """Reads the machine role Claude Code writes to ~/.claude/.machine."""
+    path = Path.home() / ".claude" / ".machine"
+    if not path.exists():
+        return ""
+    return path.read_text().strip()
+
+
 def _due_jobs(
     jobs: list[dict[str, Any]], now: datetime, fired: dict[str, str]
 ) -> list[dict[str, Any]]:
     """Picks the jobs whose time has passed today and that have not run."""
     today = now.date().isoformat()
+    machine = _this_machine()
     due = []
     for job in jobs:
         if not job.get("enabled", True):
+            continue
+        if machine not in job.get("machines", [machine]):
             continue
         if now.weekday() not in job.get("days", list(range(7))):
             continue
