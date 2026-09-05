@@ -16,6 +16,15 @@ Job shape::
 
 ``machines`` lists the roles this job runs on, matched against ``~/.claude/.machine``
 — ``headless`` on the Mac mini, ``main`` on the laptop. Omit it to run everywhere.
+
+``next`` names a job to start when ``/done`` is sent in this job's topic, which
+is how a stage says it is finished. The follower needs no ``at`` and should
+carry ``"enabled": false`` so the clock never starts it on its own — chaining
+calls it directly. Chains can run any depth: triage → support → action.
+
+``/done`` rather than closing the topic because a private chat is not a forum:
+Telegram sends no ``forum_topic_closed`` update there, so nothing observes a
+topic closing. ``topic_closed_handler`` chains too, for a supergroup setup.
 """
 
 import asyncio
@@ -127,6 +136,11 @@ async def _open_session_for_job(bot: Bot, job: dict[str, Any]) -> None:
     session_manager.bind_thread(
         user_id, thread_id, window_id, window_name=window_name
     )
+    # A job's topic is named on purpose. Setting auto_named here is what
+    # topic_namer.maybe_autoname() checks before it renames anything, so the
+    # local model leaves these rooms alone.
+    session_manager.mark_auto_named(window_id, True)
+    _remember_job_topic(thread_id, job["name"])
 
     sent, detail = await session_manager.send_to_window(window_id, job["prompt"])
     if not sent:
@@ -139,6 +153,59 @@ async def _open_session_for_job(bot: Bot, job: dict[str, Any]) -> None:
     logger.info(
         "Job %s: started in topic %d (window %s)", job["name"], thread_id, window_id
     )
+
+
+async def open_next_job(bot: Bot, thread_id: int) -> str | None:
+    """Opens the job chained after the one that owns ``thread_id``.
+
+    Called when a topic closes. Returns the name of the job it started, or
+    None when this topic came from no job, or that job names no successor.
+    """
+    name = _job_topics().get(str(thread_id))
+    _forget_job_topic(thread_id)
+    if not name:
+        return None
+
+    job = next((j for j in _load_jobs() if j["name"] == name), None)
+    nxt = job and job.get("next")
+    if not nxt:
+        return None
+
+    follower = next((j for j in _load_jobs() if j["name"] == nxt), None)
+    if not follower:
+        logger.error("Job %s: next job %r not found", name, nxt)
+        return None
+
+    await _open_session_for_job(bot, follower)
+    return nxt
+
+
+def job_name_for_topic(thread_id: int) -> str | None:
+    """Name of the job whose topic this is, or None when it came from no job."""
+    return _job_topics().get(str(thread_id))
+
+
+def _job_topics() -> dict[str, str]:
+    path = _job_topics_path()
+    if not path.exists():
+        return {}
+    return json.loads(path.read_text())
+
+
+def _remember_job_topic(thread_id: int, name: str) -> None:
+    topics = _job_topics()
+    topics[str(thread_id)] = name
+    atomic_write_json(_job_topics_path(), topics)
+
+
+def _forget_job_topic(thread_id: int) -> None:
+    topics = _job_topics()
+    if topics.pop(str(thread_id), None) is not None:
+        atomic_write_json(_job_topics_path(), topics)
+
+
+def _job_topics_path() -> Path:
+    return ccbot_dir() / "jobs-topics.json"
 
 
 def _fired_path() -> Path:

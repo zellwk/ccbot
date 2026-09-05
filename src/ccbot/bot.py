@@ -138,7 +138,7 @@ from .handlers.message_sender import (
 from .markdown_v2 import convert_markdown
 from .handlers.response_builder import build_response_parts
 from .handlers.status_polling import status_poll_loop
-from .scheduler import scheduled_jobs_loop
+from .scheduler import job_name_for_topic, open_next_job, scheduled_jobs_loop
 from .screenshot import text_to_image
 from .session import session_manager
 from .token_usage import read_usage
@@ -397,6 +397,49 @@ async def unbind_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     )
 
 
+async def done_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """LOCAL PATCH: end a job's stage and start the job chained after it.
+
+    A private chat is not a forum, so Telegram sends no forum_topic_closed
+    update and topic_closed_handler never fires. This is that signal by hand.
+    The topic's own window is killed the way closing it would have.
+    """
+    user = update.effective_user
+    if not user or not is_user_allowed(user.id):
+        return
+    if not update.message:
+        return
+
+    thread_id = _get_thread_id(update)
+    if thread_id is None:
+        await safe_reply(update.message, "❌ This command only works in a topic.")
+        return
+
+    name = job_name_for_topic(thread_id)
+    if not name:
+        await safe_reply(update.message, "❌ This topic doesn't belong to a job.")
+        return
+
+    try:
+        started = await open_next_job(context.bot, thread_id)
+    except Exception:
+        logger.exception("/done: chaining failed (job=%s, thread=%d)", name, thread_id)
+        await safe_reply(update.message, "❌ Starting the next job failed. See the log.")
+        return
+
+    if started:
+        await safe_reply(update.message, f"✅ {name} done. Started {started}.")
+        logger.info("/done: %s chained to %s (thread=%d)", name, started, thread_id)
+    else:
+        await safe_reply(update.message, f"✅ {name} done. Nothing chained after it.")
+
+    wid = session_manager.get_window_for_thread(user.id, thread_id)
+    if wid:
+        session_manager.unbind_thread(user.id, thread_id)
+        await clear_topic_state(user.id, thread_id, context.bot, context.user_data)
+        await tmux_manager.kill_window(wid)
+
+
 async def resume_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """LOCAL PATCH: rebind this topic to an earlier session in ccbot's cwd.
 
@@ -635,6 +678,18 @@ async def topic_closed_handler(
         logger.debug(
             "Topic closed: no binding (user=%d, thread=%d)", user.id, thread_id
         )
+
+    # Closing a job's topic is the signal that its stage is done, so the job
+    # chained after it starts in a topic of its own. A failure here must not
+    # stop a topic from closing.
+    try:
+        started = await open_next_job(context.bot, thread_id)
+        if started:
+            logger.info(
+                "Topic closed: chained to job %s (thread=%d)", started, thread_id
+            )
+    except Exception:
+        logger.exception("Topic closed: chaining next job failed")
 
 
 async def topic_edited_handler(
@@ -2034,7 +2089,8 @@ async def post_init(application: Application) -> None:
         BotCommand("history", "Message history for this topic"),
         BotCommand("screenshot", "Terminal screenshot with control keys"),
         BotCommand("esc", "Send Escape to interrupt Claude"),
-        BotCommand("unbind", "Unbind topic from session (keeps window running)"),
+        BotCommand("unbind", "Unbind topic from session and kill its window"),
+        BotCommand("done", "Finish this job's stage and start the next one"),
         BotCommand("resume", "Rebind this topic to an earlier session"),
         BotCommand("usage", "Show Claude Code usage remaining"),
         BotCommand("tokens", "Token usage for this topic's session"),
@@ -2141,6 +2197,7 @@ def create_bot() -> Application:
     application.add_handler(CommandHandler("esc", esc_command))
     application.add_handler(CommandHandler("resume", resume_command))
     application.add_handler(CommandHandler("unbind", unbind_command))
+    application.add_handler(CommandHandler("done", done_command))
     application.add_handler(CommandHandler("usage", usage_command))
     application.add_handler(CommandHandler("tokens", tokens_command))
     application.add_handler(CallbackQueryHandler(callback_handler))
