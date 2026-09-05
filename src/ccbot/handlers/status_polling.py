@@ -25,7 +25,7 @@ from .interactive_ui import (
     get_interactive_window,
     handle_interactive_ui,
 )
-from .cleanup import clear_topic_state
+from .cleanup import clear_topic_state, close_topic
 from .message_queue import enqueue_status_update, get_message_queue, set_typing
 
 logger = logging.getLogger(__name__)
@@ -129,6 +129,9 @@ async def status_poll_loop(bot: Bot) -> None:
                     if live_ids is not None and wid not in live_ids:
                         session_manager.unbind_thread(user_id, thread_id)
                         await clear_topic_state(user_id, thread_id, bot)
+                        # LOCAL PATCH: close the topic the dead window was
+                        # serving, so an open topic always means a live session.
+                        await close_topic(bot, user_id, thread_id)
                         logger.info(
                             "Cleaned up stale binding: user=%d thread=%d window_id=%s",
                             user_id,

@@ -398,11 +398,11 @@ async def unbind_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 async def done_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """LOCAL PATCH: end a job's stage and start the job chained after it.
+    """LOCAL PATCH: end a job's stage by closing its topic from the keyboard.
 
-    A private chat is not a forum, so Telegram sends no forum_topic_closed
-    update and topic_closed_handler never fires. This is that signal by hand.
-    The topic's own window is killed the way closing it would have.
+    Closing a topic kills its window and starts the job chained after it, all
+    in topic_closed_handler. This is that same gesture without leaving the
+    thread, for a topic already scrolled to.
     """
     user = update.effective_user
     if not user or not is_user_allowed(user.id):
@@ -420,24 +420,19 @@ async def done_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await safe_reply(update.message, "❌ This topic doesn't belong to a job.")
         return
 
+    chat_id = session_manager.resolve_chat_id(user.id, thread_id)
     try:
-        started = await open_next_job(context.bot, thread_id)
+        await context.bot.close_forum_topic(
+            chat_id=chat_id, message_thread_id=thread_id
+        )
     except Exception:
-        logger.exception("/done: chaining failed (job=%s, thread=%d)", name, thread_id)
-        await safe_reply(update.message, "❌ Starting the next job failed. See the log.")
+        logger.exception(
+            "/done: closing topic failed (job=%s, thread=%d)", name, thread_id
+        )
+        await safe_reply(update.message, "❌ Closing the topic failed. See the log.")
         return
 
-    if started:
-        await safe_reply(update.message, f"✅ {name} done. Started {started}.")
-        logger.info("/done: %s chained to %s (thread=%d)", name, started, thread_id)
-    else:
-        await safe_reply(update.message, f"✅ {name} done. Nothing chained after it.")
-
-    wid = session_manager.get_window_for_thread(user.id, thread_id)
-    if wid:
-        session_manager.unbind_thread(user.id, thread_id)
-        await clear_topic_state(user.id, thread_id, context.bot, context.user_data)
-        await tmux_manager.kill_window(wid)
+    logger.info("/done: closed topic for job %s (thread=%d)", name, thread_id)
 
 
 async def resume_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -644,16 +639,17 @@ async def topic_closed_handler(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
     """Handle topic closure — kill the associated tmux window and clean up state."""
-    user = update.effective_user
-    if not user or not is_user_allowed(user.id):
-        return
-
     thread_id = _get_thread_id(update)
     if thread_id is None:
         return
 
-    wid = session_manager.get_window_for_thread(user.id, thread_id)
-    if wid:
+    # LOCAL PATCH: read the binding by thread rather than by the closing user.
+    # ccbot closes topics itself — on /done, and when a window dies — and that
+    # service message carries the bot as its sender, so gating on an allowed
+    # user here would skip the bot's own cleanup. The binding names its owner.
+    binding = session_manager.get_binding_for_thread(thread_id)
+    if binding:
+        user_id, wid = binding
         display = session_manager.get_display_name(wid)
         w = await tmux_manager.find_window_by_id(wid)
         if w:
@@ -661,23 +657,21 @@ async def topic_closed_handler(
             logger.info(
                 "Topic closed: killed window %s (user=%d, thread=%d)",
                 display,
-                user.id,
+                user_id,
                 thread_id,
             )
         else:
             logger.info(
                 "Topic closed: window %s already gone (user=%d, thread=%d)",
                 display,
-                user.id,
+                user_id,
                 thread_id,
             )
-        session_manager.unbind_thread(user.id, thread_id)
+        session_manager.unbind_thread(user_id, thread_id)
         # Clean up all memory state for this topic
-        await clear_topic_state(user.id, thread_id, context.bot, context.user_data)
+        await clear_topic_state(user_id, thread_id, context.bot, context.user_data)
     else:
-        logger.debug(
-            "Topic closed: no binding (user=%d, thread=%d)", user.id, thread_id
-        )
+        logger.debug("Topic closed: no binding (thread=%d)", thread_id)
 
     # Closing a job's topic is the signal that its stage is done, so the job
     # chained after it starts in a topic of its own. A failure here must not

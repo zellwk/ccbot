@@ -5,14 +5,19 @@ all modules, preventing memory leaks when topics are deleted.
 
 Functions:
   - clear_topic_state: Clean up all memory state for a specific topic
+  - close_topic: Close the Telegram topic whose session has ended
 """
 
+import logging
 from typing import Any
 
 from telegram import Bot
 
+from ..session import session_manager
 from .interactive_ui import clear_interactive_msg
 from .message_queue import clear_status_msg_info, clear_tool_msg_ids_for_topic
+
+logger = logging.getLogger(__name__)
 
 
 async def clear_topic_state(
@@ -47,3 +52,18 @@ async def clear_topic_state(
         if user_data.get("_pending_thread_id") == thread_id:
             user_data.pop("_pending_thread_id", None)
             user_data.pop("_pending_thread_text", None)
+
+
+async def close_topic(bot: Bot, user_id: int, thread_id: int) -> None:
+    """Close the Telegram topic whose session has ended.
+
+    Closing a topic is what ends a session, so a window that exited on its own
+    leaves its topic open with nothing behind it. Closing it here keeps the
+    open topics equal to the live sessions. A topic already closed or already
+    gone rejects the call, which is not worth reporting.
+    """
+    chat_id = session_manager.resolve_chat_id(user_id, thread_id)
+    try:
+        await bot.close_forum_topic(chat_id=chat_id, message_thread_id=thread_id)
+    except Exception as e:  # noqa: BLE001 - a topic that won't close is not fatal
+        logger.debug("Could not close topic %d: %s", thread_id, e)

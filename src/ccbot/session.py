@@ -828,6 +828,18 @@ class SessionManager:
                 return window_id
         return None
 
+    def get_binding_for_thread(self, thread_id: int) -> tuple[int, str] | None:
+        """Look up (user_id, window_id) for a thread, whoever bound it.
+
+        LOCAL PATCH: a topic can be closed by ccbot itself, and that service
+        message carries the bot as its sender. Reading the binding by thread
+        alone lets the close be handled the same way whoever authored it.
+        """
+        for window_id, ws in self.window_states.items():
+            if ws.thread_id == thread_id and ws.user_id is not None:
+                return ws.user_id, window_id
+        return None
+
     def resolve_window_for_thread(
         self,
         user_id: int,
