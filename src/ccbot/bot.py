@@ -139,7 +139,7 @@ from .markdown_v2 import convert_markdown
 from .handlers.response_builder import build_response_parts
 from .handlers.reap import reap_loop
 from .handlers.status_polling import status_poll_loop
-from .scheduler import job_name_for_topic, open_next_job, scheduled_jobs_loop
+from .scheduler import open_next_job, scheduled_jobs_loop
 from .screenshot import text_to_image
 from .session import session_manager
 from .token_usage import read_usage
@@ -402,11 +402,12 @@ async def unbind_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 async def done_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """LOCAL PATCH: end a job's stage by closing its topic from the keyboard.
+    """LOCAL PATCH: end this topic's session and clear the topic away.
 
-    Closing a topic kills its window and starts the job chained after it, all
-    in topic_closed_handler. This is that same gesture without leaving the
-    thread, for a topic already scrolled to.
+    Closing a topic ends the session it held. /done does that and deletes the
+    topic too, so a finished thread doesn't have to be tidied up by hand. Any
+    job chained after this one opens in a topic of its own, as it would on a
+    close. Works in any topic — a job is an add-on, not a requirement.
     """
     user = update.effective_user
     if not user or not is_user_allowed(user.id):
@@ -419,24 +420,22 @@ async def done_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await safe_reply(update.message, "❌ This command only works in a topic.")
         return
 
-    name = job_name_for_topic(thread_id)
-    if not name:
-        await safe_reply(update.message, "❌ This topic doesn't belong to a job.")
-        return
-
+    # Read before ending the session, while the thread still resolves.
     chat_id = session_manager.resolve_chat_id(user.id, thread_id)
+    await end_session(context.bot, thread_id, context.user_data)
+
     try:
-        await context.bot.close_forum_topic(
+        await context.bot.delete_forum_topic(
             chat_id=chat_id, message_thread_id=thread_id
         )
     except Exception:
-        logger.exception(
-            "/done: closing topic failed (job=%s, thread=%d)", name, thread_id
+        logger.exception("/done: deleting topic failed (thread=%d)", thread_id)
+        await safe_reply(
+            update.message, "❌ Session ended, but the topic could not be deleted."
         )
-        await safe_reply(update.message, "❌ Closing the topic failed. See the log.")
         return
 
-    logger.info("/done: closed topic for job %s (thread=%d)", name, thread_id)
+    logger.info("/done: ended session and deleted topic (thread=%d)", thread_id)
 
 
 async def resume_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -642,52 +641,63 @@ def _build_screenshot_keyboard(window_id: str) -> InlineKeyboardMarkup:
 async def topic_closed_handler(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
-    """Handle topic closure — kill the associated tmux window and clean up state."""
+    """Handle topic closure — end the session the topic was holding."""
     thread_id = _get_thread_id(update)
     if thread_id is None:
         return
+    await end_session(context.bot, thread_id, context.user_data)
 
-    # LOCAL PATCH: read the binding by thread rather than by the closing user.
-    # ccbot closes topics itself — on /done, and when a window dies — and that
-    # service message carries the bot as its sender, so gating on an allowed
-    # user here would skip the bot's own cleanup. The binding names its owner.
+
+async def end_session(
+    bot: Bot, thread_id: int, user_data: dict[str, Any] | None = None
+) -> None:
+    """LOCAL PATCH: end the session a topic holds, and start any job after it.
+
+    Killing the window is what ends a session; dropping the binding, clearing
+    the topic's memory state and chaining the next job all follow from it. A
+    closed topic and /done both arrive here, so neither grows its own version
+    of the teardown.
+
+    The binding is read by thread rather than by the acting user. ccbot ends
+    sessions itself, and the service message for a close it authored carries
+    the bot as its sender.
+    """
     binding = session_manager.get_binding_for_thread(thread_id)
     if binding:
-        user_id, wid = binding
-        display = session_manager.get_display_name(wid)
-        w = await tmux_manager.find_window_by_id(wid)
-        if w:
-            await tmux_manager.kill_window(w.window_id)
+        user_id, window_id = binding
+        display = session_manager.get_display_name(window_id)
+        window = await tmux_manager.find_window_by_id(window_id)
+        if window:
+            await tmux_manager.kill_window(window.window_id)
             logger.info(
-                "Topic closed: killed window %s (user=%d, thread=%d)",
+                "Session ended: killed window %s (user=%d, thread=%d)",
                 display,
                 user_id,
                 thread_id,
             )
         else:
             logger.info(
-                "Topic closed: window %s already gone (user=%d, thread=%d)",
+                "Session ended: window %s already gone (user=%d, thread=%d)",
                 display,
                 user_id,
                 thread_id,
             )
         session_manager.unbind_thread(user_id, thread_id)
-        # Clean up all memory state for this topic
-        await clear_topic_state(user_id, thread_id, context.bot, context.user_data)
+        await clear_topic_state(user_id, thread_id, bot, user_data)
     else:
-        logger.debug("Topic closed: no binding (thread=%d)", thread_id)
+        logger.debug("Session ended: no binding (thread=%d)", thread_id)
 
-    # Closing a job's topic is the signal that its stage is done, so the job
+    # A job's topic ending is the signal that its stage is done, so the job
     # chained after it starts in a topic of its own. A failure here must not
-    # stop a topic from closing.
+    # stop the topic from going.
     try:
-        started = await open_next_job(context.bot, thread_id)
+        started = await open_next_job(bot, thread_id)
         if started:
             logger.info(
-                "Topic closed: chained to job %s (thread=%d)", started, thread_id
+                "Session ended: chained to job %s (thread=%d)", started, thread_id
             )
     except Exception:
-        logger.exception("Topic closed: chaining next job failed")
+        logger.exception("Session ended: chaining next job failed")
 
 
 async def topic_edited_handler(
