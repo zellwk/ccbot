@@ -43,9 +43,12 @@ REAP_INTERVAL_SECONDS = 300.0
 # what its own transcript already said.
 RECENT_ACTIVITY_SECONDS = 120.0
 
-# An unbound window has no topic to ask Telegram about, so nothing but a long
-# silence separates one that was abandoned from one between sessions.
-UNBOUND_IDLE_SECONDS = 900.0
+# An unbound window has no topic to ask Telegram about, so silence is the only
+# thing separating one that was abandoned from one between sessions. This is
+# the number that governs how long a deleted topic leaves its window running:
+# the send that fails into a deleted topic drops the binding on the spot, so
+# the window lands here rather than at the probe.
+UNBOUND_IDLE_SECONDS = 300.0
 
 # A burst of probes earns a 429, which answers nothing about any of them.
 MAX_PROBES_PER_PASS = 5
