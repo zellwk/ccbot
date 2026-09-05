@@ -137,6 +137,7 @@ from .handlers.message_sender import (
 )
 from .markdown_v2 import convert_markdown
 from .handlers.response_builder import build_response_parts
+from .handlers.reap import reap_loop
 from .handlers.status_polling import status_poll_loop
 from .scheduler import job_name_for_topic, open_next_job, scheduled_jobs_loop
 from .screenshot import text_to_image
@@ -164,6 +165,9 @@ _status_poll_task: asyncio.Task | None = None
 
 # Scheduled jobs task
 _scheduled_jobs_task: asyncio.Task | None = None
+
+# Reaping task
+_reap_task: asyncio.Task | None = None
 
 # Claude Code commands shown in bot menu (forwarded via tmux)
 CC_COMMANDS: dict[str, str] = {
@@ -2062,7 +2066,7 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
 
 
 async def post_init(application: Application) -> None:
-    global session_monitor, _status_poll_task, _scheduled_jobs_task
+    global session_monitor, _status_poll_task, _scheduled_jobs_task, _reap_task
 
     # Clear every scope we might have written before, plus stale scopes left by
     # earlier setups (BotFather, older versions).  A narrower scope beats the
@@ -2141,9 +2145,22 @@ async def post_init(application: Application) -> None:
     _scheduled_jobs_task = asyncio.create_task(scheduled_jobs_loop(application.bot))
     logger.info("Scheduled jobs task started")
 
+    _reap_task = asyncio.create_task(reap_loop(application.bot))
+    logger.info("Reaping task started")
+
 
 async def post_shutdown(application: Application) -> None:
-    global _status_poll_task, _scheduled_jobs_task
+    global _status_poll_task, _scheduled_jobs_task, _reap_task
+
+    # Stop reaping
+    if _reap_task:
+        _reap_task.cancel()
+        try:
+            await _reap_task
+        except asyncio.CancelledError:
+            pass
+        _reap_task = None
+        logger.info("Reaping stopped")
 
     # Stop scheduled jobs
     if _scheduled_jobs_task:
