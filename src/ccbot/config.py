@@ -57,6 +57,12 @@ class Config:
                 "Expected comma-separated Telegram user IDs."
             ) from e
 
+        # LOCAL PATCH: the forum supergroup a bot-opened topic goes in. A private
+        # chat is not a forum, so Telegram sends no forum_topic_closed there and
+        # a closing topic signals nothing. Unset keeps topics in the private chat.
+        forum_chat_id = os.getenv("CCBOT_FORUM_CHAT_ID", "").strip()
+        self.forum_chat_id: int | None = int(forum_chat_id) if forum_chat_id else None
+
         # Tmux session name and window naming
         self.tmux_session_name = os.getenv("TMUX_SESSION_NAME", "ccbot")
         self.tmux_main_window_name = "__main__"

@@ -114,11 +114,14 @@ def _due_jobs(
 async def _open_session_for_job(bot: Bot, job: dict[str, Any]) -> None:
     """Opens the topic, starts the session, sends the prompt."""
     user_id = next(iter(config.allowed_users))
-    chat_id = session_manager.resolve_chat_id(user_id)
+    chat_id = config.forum_chat_id or session_manager.resolve_chat_id(user_id)
     title = f"{job['topic']} · {datetime.now():%b %d}"
 
     topic = await bot.create_forum_topic(chat_id=chat_id, name=title)
     thread_id = topic.message_thread_id
+    # Nothing has arrived from this topic yet, so record where it lives now.
+    # Every outbound call for the thread resolves through this mapping.
+    session_manager.set_group_chat_id(user_id, thread_id, chat_id)
 
     created, detail, window_name, window_id = await tmux_manager.create_window(
         job["cwd"]

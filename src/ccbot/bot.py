@@ -766,7 +766,7 @@ async def forward_command_handler(
     # Required: Telegram Bot API needs group chat_id (not user_id) to send
     # messages with message_thread_id. Do NOT remove — see session.py docs.
     chat = update.effective_chat
-    if chat and chat.type in ("group", "supergroup"):
+    if chat:
         session_manager.set_group_chat_id(user.id, thread_id, chat.id)
 
     cmd_text = update.message.text or ""
@@ -854,7 +854,7 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             return
         thread_id, reply_to = opened
 
-    if chat.type in ("group", "supergroup"):
+    if chat:
         session_manager.set_group_chat_id(user.id, thread_id, chat.id)
 
     # Download the highest-resolution photo
@@ -940,7 +940,7 @@ async def voice_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             return
         thread_id, reply_to = opened
 
-    if chat.type in ("group", "supergroup"):
+    if chat:
         session_manager.set_group_chat_id(user.id, thread_id, chat.id)
 
     # Download voice as in-memory bytes
@@ -1157,7 +1157,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     # Required: Telegram Bot API needs group chat_id (not user_id) to send
     # messages with message_thread_id. Do NOT remove — see session.py docs.
     chat = update.effective_chat
-    if chat and chat.type in ("group", "supergroup"):
+    if chat:
         session_manager.set_group_chat_id(user.id, thread_id, chat.id)
 
     wid = await _resolve_window_for_thread(context, user, thread_id, text, reply_to)
@@ -1402,7 +1402,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     # messages with message_thread_id. Do NOT remove — see session.py docs.
     cb_thread_id = _get_thread_id(update)
     chat = update.effective_chat
-    if chat and chat.type in ("group", "supergroup"):
+    if chat:
         session_manager.set_group_chat_id(user.id, cb_thread_id, chat.id)
 
     # History: older/newer pagination

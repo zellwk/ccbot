@@ -471,8 +471,13 @@ class SessionManager:
     def resolve_chat_id(self, user_id: int, thread_id: int | None = None) -> int:
         """Resolve the correct chat_id for sending messages.
 
-        Returns the stored group chat_id when a thread_id is present and a
-        mapping exists, otherwise falls back to user_id (for private chats).
+        Returns the stored chat_id for the thread. Every inbound message
+        records one, so a mapping exists for any topic that has been used.
+
+        LOCAL PATCH: an unmapped thread falls back to the configured forum
+        rather than to user_id, because topics now live in the supergroup and
+        a private chat cannot hold a thread the forum opened. Without a forum
+        configured the fallback is user_id, as before.
 
         Every outbound Telegram API call (send_message, edit_message_text,
         delete_message, send_chat_action, edit_forum_topic, etc.) MUST use
@@ -484,6 +489,8 @@ class SessionManager:
             group_id = self.group_chat_ids.get(key)
             if group_id is not None:
                 return group_id
+            if config.forum_chat_id is not None:
+                return config.forum_chat_id
         return user_id
 
     async def wait_for_session_map_entry(
