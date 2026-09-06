@@ -830,7 +830,7 @@ async def unsupported_content_handler(
     logger.debug("Unsupported content from user %d", user.id)
     await safe_reply(
         update.message,
-        "⚠ Only text, photo, and voice messages are supported. Stickers, video, and other media cannot be forwarded to Claude Code.",
+        "⚠ This content can't be forwarded to Claude Code. Text, photos, voice, video, audio and files all work.",
     )
 
 
@@ -915,6 +915,116 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     # only a restatement of what they just did. Failures above still report.
     if config.show_user_messages:
         await safe_reply(reply_to, "📷 Image sent to Claude Code.")
+
+
+# --- Media directory for incoming video, audio and documents ---
+_MEDIA_DIR = ccbot_dir() / "media"
+_MEDIA_DIR.mkdir(parents=True, exist_ok=True)
+
+# Telegram hands a bot nothing larger than this, whatever the client uploaded.
+_MAX_DOWNLOAD_BYTES = 20 * 1024 * 1024
+
+
+async def media_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """LOCAL PATCH: save a video, audio file or document and give Claude Code its path.
+
+    Photos already take this route; everything else used to reach the
+    unsupported catch-all. The size check runs before the download so an
+    oversized file gets an answer it can act on rather than a getFile error.
+    """
+    user = update.effective_user
+    if not user or not is_user_allowed(user.id):
+        if update.message:
+            await safe_reply(update.message, "You are not authorized to use this bot.")
+        return
+
+    message = update.message
+    if not message:
+        return
+
+    attachment = (
+        message.video
+        or message.video_note
+        or message.animation
+        or message.audio
+        or message.document
+    )
+    if attachment is None:
+        return
+
+    if (attachment.file_size or 0) > _MAX_DOWNLOAD_BYTES:
+        await safe_reply(
+            message,
+            "❌ Telegram caps bot downloads at 20 MB. Put the file on this machine and send me the path instead.",
+        )
+        return
+
+    thread_id = _get_thread_id(update)
+    reply_to: Any = message
+
+    if thread_id is None:
+        opened = await _open_topic_for_main_chat(update, context, user)
+        if opened is None:
+            await safe_reply(
+                message,
+                "❌ Couldn't open a topic for this. Create one and send it there.",
+            )
+            return
+        thread_id, reply_to = opened
+
+    if message.chat:
+        session_manager.set_group_chat_id(user.id, thread_id, message.chat.id)
+
+    # Keeps the sender's own extension, falling back to the one Telegram serves
+    tg_file = await attachment.get_file()
+    sent_name = getattr(attachment, "file_name", "") or ""
+    suffix = Path(sent_name).suffix or Path(tg_file.file_path or "").suffix
+    file_path = _MEDIA_DIR / f"{int(time.time())}_{attachment.file_unique_id}{suffix}"
+    await tg_file.download_to_drive(file_path)
+
+    # Names the kind so Claude knows what it has been handed
+    if message.audio:
+        kind = "audio"
+    elif message.document:
+        kind = "file"
+    else:
+        kind = "video"
+
+    text_to_send = f"({kind} attached: {file_path})"
+    caption = message.caption or ""
+    if caption:
+        text_to_send = f"{caption}\n\n{text_to_send}"
+
+    wid = await _resolve_window_for_thread(
+        context, user, thread_id, text_to_send, reply_to
+    )
+    if wid is None:
+        return
+
+    w = await tmux_manager.find_window_by_id(wid)
+    if not w:
+        display = session_manager.get_display_name(wid)
+        session_manager.unbind_thread(user.id, thread_id)
+        await safe_reply(
+            reply_to,
+            f"❌ Window '{display}' no longer exists. Binding removed.\n"
+            "Send a message to start a new session.",
+        )
+        return
+
+    try:
+        await message.chat.send_action(ChatAction.TYPING)
+    except Exception as e:
+        logger.warning("send_action(TYPING) failed, continuing to injection: %s", e)
+    clear_status_msg_info(user.id, thread_id)
+
+    success, detail = await session_manager.send_to_window(wid, text_to_send)
+    if not success:
+        await safe_reply(reply_to, f"❌ {detail}")
+        return
+
+    if config.show_user_messages:
+        await safe_reply(reply_to, f"📎 {kind.capitalize()} sent to Claude Code.")
 
 
 async def voice_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2247,6 +2357,17 @@ def create_bot() -> Application:
     application.add_handler(MessageHandler(filters.PHOTO, photo_handler))
     # Voice: transcribe via OpenAI and forward text to Claude Code
     application.add_handler(MessageHandler(filters.VOICE, voice_handler))
+    # LOCAL PATCH: video, audio and documents — save and forward the file path
+    application.add_handler(
+        MessageHandler(
+            filters.VIDEO
+            | filters.VIDEO_NOTE
+            | filters.ANIMATION
+            | filters.AUDIO
+            | filters.Document.ALL,
+            media_handler,
+        )
+    )
     # Catch-all: non-text content (stickers, video, etc.)
     application.add_handler(
         MessageHandler(
