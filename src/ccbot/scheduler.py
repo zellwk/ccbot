@@ -17,10 +17,11 @@ Job shape::
 ``machines`` lists the roles this job runs on, matched against ``~/.claude/.machine``
 — ``headless`` on the Mac mini, ``main`` on the laptop. Omit it to run everywhere.
 
-``next`` names a job to start when ``/done`` is sent in this job's topic, which
-is how a stage says it is finished. The follower needs no ``at`` and should
-carry ``"enabled": false`` so the clock never starts it on its own — chaining
-calls it directly. Chains can run any depth: triage → support → action.
+``next`` names a job, or a list of jobs, to start when ``/done`` is sent in this
+job's topic, which is how a stage says it is finished. A list opens one topic per
+follower, in order. Each follower needs no ``at`` and should carry
+``"enabled": false`` so the clock never starts it on its own — chaining calls it
+directly. Chains can run any depth: triage → support → action.
 
 ``/done`` rather than closing the topic because a private chat is not a forum:
 Telegram sends no ``forum_topic_closed`` update there, so nothing observes a
@@ -158,29 +159,33 @@ async def _open_session_for_job(bot: Bot, job: dict[str, Any]) -> None:
     )
 
 
-async def open_next_job(bot: Bot, thread_id: int) -> str | None:
-    """Opens the job chained after the one that owns ``thread_id``.
+async def open_next_job(bot: Bot, thread_id: int) -> list[str]:
+    """Opens the jobs chained after the one that owns ``thread_id``.
 
-    Called when a topic closes. Returns the name of the job it started, or
-    None when this topic came from no job, or that job names no successor.
+    Called when a topic closes. Returns the names of the jobs it started —
+    empty when this topic came from no job, or that job names no successor.
     """
     name = _job_topics().get(str(thread_id))
     _forget_job_topic(thread_id)
     if not name:
-        return None
+        return []
 
     job = next((j for j in _load_jobs() if j["name"] == name), None)
     nxt = job and job.get("next")
     if not nxt:
-        return None
+        return []
+    followers = [nxt] if isinstance(nxt, str) else list(nxt)
 
-    follower = next((j for j in _load_jobs() if j["name"] == nxt), None)
-    if not follower:
-        logger.error("Job %s: next job %r not found", name, nxt)
-        return None
-
-    await _open_session_for_job(bot, follower)
-    return nxt
+    started = []
+    jobs = _load_jobs()
+    for follower_name in followers:
+        follower = next((j for j in jobs if j["name"] == follower_name), None)
+        if not follower:
+            logger.error("Job %s: next job %r not found", name, follower_name)
+            continue
+        await _open_session_for_job(bot, follower)
+        started.append(follower_name)
+    return started
 
 
 def job_name_for_topic(thread_id: int) -> str | None:

@@ -687,14 +687,16 @@ async def end_session(
     else:
         logger.debug("Session ended: no binding (thread=%d)", thread_id)
 
-    # A job's topic ending is the signal that its stage is done, so the job
+    # A job's topic ending is the signal that its stage is done, so each job
     # chained after it starts in a topic of its own. A failure here must not
     # stop the topic from going.
     try:
         started = await open_next_job(bot, thread_id)
         if started:
             logger.info(
-                "Session ended: chained to job %s (thread=%d)", started, thread_id
+                "Session ended: chained to jobs %s (thread=%d)",
+                ", ".join(started),
+                thread_id,
             )
     except Exception:
         logger.exception("Session ended: chaining next job failed")
