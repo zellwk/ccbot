@@ -25,7 +25,7 @@ from typing import Literal
 
 from telegram import Bot
 from telegram.constants import ChatAction
-from telegram.error import RetryAfter
+from telegram.error import BadRequest, RetryAfter
 
 from ..markdown_v2 import convert_markdown
 from ..session import session_manager
@@ -403,7 +403,7 @@ async def _process_content_task(bot: Bot, user_id: int, task: MessageTask) -> No
                 return
             except RetryAfter:
                 raise
-            except Exception:
+            except BadRequest:
                 try:
                     # Fallback: plain text with sentinels stripped
                     plain_text = strip_sentinels(task.text or full_text)
@@ -421,6 +421,11 @@ async def _process_content_task(bot: Bot, user_id: int, task: MessageTask) -> No
                 except Exception:
                     logger.debug(f"Failed to edit tool msg {edit_msg_id}, sending new")
                     # Fall through to send as new message
+            except Exception as e:
+                # A timeout or network error may already have applied the edit.
+                # Retrying spends another call for nothing.
+                logger.debug(f"Failed to edit tool msg {edit_msg_id}: {e}")
+                # Fall through to send as new message
 
     # 2. Send content messages, converting status message to first content part
     # Only the last part of Claude's reply notifies. Status lines, tool traffic
@@ -510,7 +515,7 @@ async def _convert_status_to_content(
         return msg_id
     except RetryAfter:
         raise
-    except Exception:
+    except BadRequest:
         try:
             # Fallback to plain text with sentinels stripped
             plain = strip_sentinels(content_text)
@@ -527,6 +532,11 @@ async def _convert_status_to_content(
             logger.debug(f"Failed to convert status to content: {e}")
             # Message might be deleted or too old, caller will send new message
             return None
+    except Exception as e:
+        # A timeout or network error may already have applied the edit.
+        # Retrying spends another call for nothing.
+        logger.debug(f"Failed to convert status to content: {e}")
+        return None
 
 
 def set_typing(bot: Bot, user_id: int, thread_id: int | None, active: bool) -> None:
@@ -605,7 +615,7 @@ async def _process_status_update_task(
                 _status_msg_info[skey] = (msg_id, wid, status_text)
             except RetryAfter:
                 raise
-            except Exception:
+            except BadRequest:
                 try:
                     await bot.edit_message_text(
                         chat_id=chat_id,
@@ -620,6 +630,12 @@ async def _process_status_update_task(
                     logger.debug(f"Failed to edit status message: {e}")
                     _status_msg_info.pop(skey, None)
                     await _do_send_status_message(bot, user_id, tid, wid, status_text)
+            except Exception as e:
+                # A timeout or network error may already have applied the edit.
+                # Retrying spends another call for nothing.
+                logger.debug(f"Failed to edit status message: {e}")
+                _status_msg_info.pop(skey, None)
+                await _do_send_status_message(bot, user_id, tid, wid, status_text)
     else:
         # No existing status message, send new
         await _do_send_status_message(bot, user_id, tid, wid, status_text)

@@ -90,7 +90,7 @@ async def send_with_fallback(
         )
     except RetryAfter:
         raise
-    except Exception as exc:
+    except BadRequest as exc:
         _raise_if_dead_thread(exc)
         try:
             return await bot.send_message(
@@ -102,6 +102,11 @@ async def send_with_fallback(
             _raise_if_dead_thread(e)
             logger.error(f"Failed to send message to {chat_id}: {e}")
             return None
+    except Exception as e:
+        # A timeout or network error may already have been delivered upstream.
+        # Resending here doubles the send and earns a flood wait, so give up.
+        logger.error(f"Failed to send message to {chat_id}: {e}")
+        return None
 
 
 async def send_photo(
@@ -157,7 +162,7 @@ async def safe_reply(message: Message, text: str, **kwargs: Any) -> Message:
         )
     except RetryAfter:
         raise
-    except Exception:
+    except BadRequest:
         try:
             return await message.reply_text(strip_sentinels(text), **kwargs)
         except RetryAfter:
@@ -165,6 +170,11 @@ async def safe_reply(message: Message, text: str, **kwargs: Any) -> Message:
         except Exception as e:
             logger.error(f"Failed to reply: {e}")
             raise
+    except Exception as e:
+        # A timeout or network error may already have been delivered upstream.
+        # Resending here doubles the send and earns a flood wait, so give up.
+        logger.error(f"Failed to reply: {e}")
+        raise
 
 
 async def safe_edit(target: Any, text: str, **kwargs: Any) -> None:
@@ -178,13 +188,17 @@ async def safe_edit(target: Any, text: str, **kwargs: Any) -> None:
         )
     except RetryAfter:
         raise
-    except Exception:
+    except BadRequest:
         try:
             await target.edit_message_text(strip_sentinels(text), **kwargs)
         except RetryAfter:
             raise
         except Exception as e:
             logger.error("Failed to edit message: %s", e)
+    except Exception as e:
+        # A timeout or network error may already have been delivered upstream.
+        # Resending here doubles the send and earns a flood wait, so give up.
+        logger.error("Failed to edit message: %s", e)
 
 
 async def safe_send(
@@ -207,7 +221,7 @@ async def safe_send(
         )
     except RetryAfter:
         raise
-    except Exception as exc:
+    except BadRequest as exc:
         _raise_if_dead_thread(exc)
         try:
             await bot.send_message(
@@ -218,3 +232,7 @@ async def safe_send(
         except Exception as e:
             _raise_if_dead_thread(e)
             logger.error(f"Failed to send message to {chat_id}: {e}")
+    except Exception as e:
+        # A timeout or network error may already have been delivered upstream.
+        # Resending here doubles the send and earns a flood wait, so give up.
+        logger.error(f"Failed to send message to {chat_id}: {e}")
