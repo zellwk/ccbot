@@ -6,6 +6,11 @@ date lives in ``~/.ccbot/jobs-fired.json`` so a restart neither double-fires
 nor skips. A job whose time passed while the bot was down fires on the next
 tick — late beats never for a morning report.
 
+A job with no entry in ``jobs-fired.json`` at all has never been seen, so it is
+new rather than late. It records today's date without running and starts at its
+next slot. Without this, adding a job whose time is earlier in the day fires it
+the moment the file lands.
+
 Job shape::
 
     {"name": "email-triage", "at": "08:00", "days": [0,1,2,3,4,5,6],
@@ -58,7 +63,15 @@ async def scheduled_jobs_loop(bot: Bot) -> None:
             fired = _load_fired_dates()
             now = datetime.now()
             for job in _due_jobs(_load_jobs(), now, fired):
-                await _open_session_for_job(bot, job)
+                first_seen = job["name"] not in fired
+                if first_seen:
+                    logger.info(
+                        "Job %s seen for the first time past its time; "
+                        "first run is its next slot",
+                        job["name"],
+                    )
+                else:
+                    await _open_session_for_job(bot, job)
                 fired[job["name"]] = now.date().isoformat()
                 atomic_write_json(_fired_path(), fired)
         except asyncio.CancelledError:
@@ -137,9 +150,7 @@ async def _open_session_for_job(bot: Bot, job: dict[str, Any]) -> None:
     await session_manager.wait_for_session_map_entry(
         window_id, timeout=SESSION_MAP_TIMEOUT
     )
-    session_manager.bind_thread(
-        user_id, thread_id, window_id, window_name=window_name
-    )
+    session_manager.bind_thread(user_id, thread_id, window_id, window_name=window_name)
     # A job's topic is named on purpose. Setting auto_named here is what
     # topic_namer.maybe_autoname() checks before it renames anything, so the
     # local model leaves these rooms alone.
