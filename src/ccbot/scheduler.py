@@ -1,4 +1,15 @@
-"""Scheduled jobs — opens a topic, starts a session in it, sends it a prompt.
+"""Scheduled jobs — works the job headless, then opens a topic only if it has something.
+
+A job is worked by ``claude -p`` first, with nothing on Telegram. When that pass
+reports nothing, the job ends there: no topic, no notification, no tmux window to
+close by hand. When it does have something, the topic opens, the report is posted,
+and the window resumes that same session — so a reply lands in the conversation that
+already did the work rather than repeating it.
+
+``when`` names a shell command that decides due-ness before the headless pass runs.
+Exit 0 opens the gate, anything else ends the job. It exists because a headless pass
+costs real money whether or not it finds anything, so a job whose due-ness is plain
+from a file should answer that in code. Omit it for a job only the model can judge.
 
 Reads ``~/.ccbot/jobs.json`` every tick so edits land without a restart. A job
 fires once its time has passed today and it has not already run; the last fire
@@ -15,7 +26,8 @@ Job shape::
 
     {"name": "email-triage", "at": "08:00", "days": [0,1,2,3,4,5,6],
      "machines": ["headless"], "cwd": "/Users/zellwk/projects",
-     "topic": "Email triage", "prompt": "triage emails"}
+     "topic": "Email triage", "prompt": "triage emails",
+     "when": "node check-due.js"}
 
 ``days`` uses Python weekdays, Monday 0. Omit it for every day.
 
@@ -36,13 +48,15 @@ topic closing. ``topic_closed_handler`` chains too, for a supergroup setup.
 import asyncio
 import json
 import logging
+import os
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 from telegram import Bot
 
 from .config import config
+from .handlers.message_sender import safe_send
 from .session import session_manager
 from .tmux_manager import tmux_manager
 from .utils import atomic_write_json, ccbot_dir
@@ -54,6 +68,44 @@ TICK_SECONDS = 30.0
 # Long enough for Claude Code's SessionStart hook to register the window.
 SESSION_MAP_TIMEOUT = 5.0
 
+# A morning report can take a while to assemble; past this the pass is stuck.
+HEADLESS_TIMEOUT_SECONDS = 1200.0
+
+# `has_report` decides whether a topic opens at all, and its description is the only
+# place a job learns which way to lean, so the bias is written into the schema.
+REPORT_SCHEMA = json.dumps(
+    {
+        "type": "object",
+        "properties": {
+            "has_report": {
+                "type": "boolean",
+                "description": (
+                    "True only when there is something Zell has to see. This job runs "
+                    "again tomorrow and anything still outstanding comes back then, so "
+                    "leave it false when in doubt — staying quiet costs a day, while a "
+                    "topic opened over nothing costs him a notification every morning."
+                ),
+            },
+            "report": {
+                "type": "string",
+                "description": "The message to post, written as it should read on a phone.",
+            },
+        },
+        "required": ["has_report"],
+    }
+)
+
+
+class JobReport(NamedTuple):
+    """A headless pass's report, and the session a reply can carry on in.
+
+    ``session_id`` is empty when the pass left nothing resumable — a timeout or a
+    crash — and the topic then opens on a fresh session.
+    """
+
+    text: str
+    session_id: str
+
 
 async def scheduled_jobs_loop(bot: Bot) -> None:
     """Runs each due job in a topic of its own, once a day."""
@@ -64,16 +116,19 @@ async def scheduled_jobs_loop(bot: Bot) -> None:
             now = datetime.now()
             for job in _due_jobs(_load_jobs(), now, fired):
                 first_seen = job["name"] not in fired
+                # Recorded before the job starts, not after. A headless pass takes
+                # minutes and the next tick is 30 seconds away, so a date written
+                # afterwards leaves a gap that fires the same job again.
+                fired[job["name"]] = now.date().isoformat()
+                atomic_write_json(_fired_path(), fired)
                 if first_seen:
                     logger.info(
                         "Job %s seen for the first time past its time; "
                         "first run is its next slot",
                         job["name"],
                     )
-                else:
-                    await _open_session_for_job(bot, job)
-                fired[job["name"]] = now.date().isoformat()
-                atomic_write_json(_fired_path(), fired)
+                    continue
+                await _open_session_for_job(bot, job)
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -126,7 +181,16 @@ def _due_jobs(
 
 
 async def _open_session_for_job(bot: Bot, job: dict[str, Any]) -> None:
-    """Opens the topic, starts the session, sends the prompt."""
+    """Works the job headless, and opens a topic only when it has something to say."""
+    if not await _is_gate_open(job):
+        logger.info("Job %s: gate closed, nothing opened", job["name"])
+        return
+
+    report = await _get_job_report(job)
+    if report is None:
+        logger.info("Job %s: nothing to report, nothing opened", job["name"])
+        return
+
     user_id = next(iter(config.allowed_users))
     chat_id = config.forum_chat_id or session_manager.resolve_chat_id(user_id)
     title = f"{job['topic']} · {datetime.now():%b %d}"
@@ -137,13 +201,19 @@ async def _open_session_for_job(bot: Bot, job: dict[str, Any]) -> None:
     # Every outbound call for the thread resolves through this mapping.
     session_manager.set_group_chat_id(user_id, thread_id, chat_id)
 
+    # Posted before the window exists. The report is the thing worth delivering, and
+    # a window that fails to open must not take the findings down with it.
+    await safe_send(bot, chat_id, report.text, message_thread_id=thread_id)
+
+    # The work is already done, so the window carries on that same session rather
+    # than starting cold and being asked the same question twice.
     created, detail, window_name, window_id = await tmux_manager.create_window(
-        job["cwd"]
+        job["cwd"], resume_session_id=report.session_id or None
     )
     if not created:
         logger.error("Job %s: window failed: %s", job["name"], detail)
-        await bot.send_message(
-            chat_id, f"❌ {job['name']}: {detail}", message_thread_id=thread_id
+        await safe_send(
+            bot, chat_id, f"❌ {job['name']}: {detail}", message_thread_id=thread_id
         )
         return
 
@@ -157,17 +227,87 @@ async def _open_session_for_job(bot: Bot, job: dict[str, Any]) -> None:
     session_manager.mark_auto_named(window_id, True)
     _remember_job_topic(thread_id, job["name"])
 
-    sent, detail = await session_manager.send_to_window(window_id, job["prompt"])
-    if not sent:
-        logger.error("Job %s: prompt failed: %s", job["name"], detail)
-        await bot.send_message(
-            chat_id, f"❌ {job['name']}: {detail}", message_thread_id=thread_id
-        )
-        return
-
     logger.info(
-        "Job %s: started in topic %d (window %s)", job["name"], thread_id, window_id
+        "Job %s: reported in topic %d (window %s)", job["name"], thread_id, window_id
     )
+
+
+async def _is_gate_open(job: dict[str, Any]) -> bool:
+    """Runs the job's ``when`` command. True when it exits 0, or names no gate."""
+    command = job.get("when")
+    if not command:
+        return True
+
+    proc = await asyncio.create_subprocess_shell(
+        command,
+        cwd=job["cwd"],
+        env=_job_env(),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, stderr = await proc.communicate()
+    logger.info(
+        "Job %s: gate exit %s (%s)",
+        job["name"],
+        proc.returncode,
+        stdout.decode().strip() or stderr.decode().strip(),
+    )
+    return proc.returncode == 0
+
+
+async def _get_job_report(job: dict[str, Any]) -> JobReport | None:
+    """Works the job headless. None when it found nothing worth opening a topic for."""
+    proc = await asyncio.create_subprocess_exec(
+        config.claude_command,
+        "-p",
+        job["prompt"],
+        "--json-schema",
+        REPORT_SCHEMA,
+        "--output-format",
+        "json",
+        cwd=job["cwd"],
+        env=_job_env(),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+
+    try:
+        stdout, stderr = await asyncio.wait_for(
+            proc.communicate(), HEADLESS_TIMEOUT_SECONDS
+        )
+    except TimeoutError:
+        proc.kill()
+        logger.error("Job %s: headless pass timed out", job["name"])
+        return JobReport(f"❌ {job['name']}: timed out before it reported.", "")
+
+    if proc.returncode != 0:
+        logger.error(
+            "Job %s: headless pass exited %s: %s",
+            job["name"],
+            proc.returncode,
+            stderr.decode().strip()[-500:],
+        )
+        return JobReport(f"❌ {job['name']}: the headless pass failed.", "")
+
+    result = json.loads(stdout)
+    logger.info(
+        "Job %s: headless pass cost $%.4f", job["name"], result.get("total_cost_usd", 0)
+    )
+
+    output = result.get("structured_output") or {}
+    if not output.get("has_report"):
+        return None
+    return JobReport(output.get("report", ""), result.get("session_id", ""))
+
+
+def _job_env() -> dict[str, str]:
+    """Environment for a job's subprocesses, with the PATH launchd leaves out."""
+    home = str(Path.home())
+    env = dict(os.environ)
+    env["PATH"] = (
+        f"{home}/.local/bin:{home}/n/bin:/opt/homebrew/bin:{env.get('PATH', '')}"
+    )
+    return env
 
 
 async def open_next_job(bot: Bot, thread_id: int) -> list[str]:
