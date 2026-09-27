@@ -172,6 +172,7 @@ _reap_task: asyncio.Task | None = None
 # Claude Code commands shown in bot menu (forwarded via tmux)
 CC_COMMANDS: dict[str, str] = {
     "agents": "↗ Manage subagents",
+    "autonomous": "↗ Work unattended until an end condition",
     "clear": "↗ Clear conversation history",
     "compact": "↗ Compact conversation context",
     "context": "↗ Show context window usage",
