@@ -58,6 +58,7 @@ from telegram import Bot
 from .config import config
 from .handlers.message_sender import safe_send
 from .session import session_manager
+from .telegram_sender import split_message
 from .tmux_manager import tmux_manager
 from .utils import atomic_write_json, ccbot_dir
 
@@ -202,8 +203,11 @@ async def _open_session_for_job(bot: Bot, job: dict[str, Any]) -> None:
     session_manager.set_group_chat_id(user_id, thread_id, chat_id)
 
     # Posted before the window exists. The report is the thing worth delivering, and
-    # a window that fails to open must not take the findings down with it.
-    await safe_send(bot, chat_id, report.text, message_thread_id=thread_id)
+    # a window that fails to open must not take the findings down with it. Split with
+    # room for MarkdownV2 escaping, as response_builder does: sent whole, a report past
+    # Telegram's limit fails outright and leaves the topic empty.
+    for chunk in split_message(report.text, max_length=3000):
+        await safe_send(bot, chat_id, chunk, message_thread_id=thread_id)
 
     # The work is already done, so the window carries on that same session rather
     # than starting cold and being asked the same question twice.
