@@ -689,8 +689,17 @@ async def end_session(
         logger.debug("Session ended: no binding (thread=%d)", thread_id)
 
     # A job's topic ending is the signal that its stage is done, so each job
-    # chained after it starts in a topic of its own. A failure here must not
-    # stop the topic from going.
+    # chained after it starts in a topic of its own. Chained jobs work headless
+    # for minutes, so they run as their own task: awaited here, they hold every
+    # update behind this one, including the next /done, until they finish.
+    asyncio.create_task(_chain_next_jobs(bot, thread_id))
+
+
+async def _chain_next_jobs(bot: Bot, thread_id: int) -> None:
+    """LOCAL PATCH: start the jobs chained after the one that owned the topic.
+
+    A failure here must not stop the topic from going.
+    """
     try:
         started = await open_next_job(bot, thread_id)
         if started:
