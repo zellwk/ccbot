@@ -139,7 +139,7 @@ from .markdown_v2 import convert_markdown
 from .handlers.response_builder import build_response_parts
 from .handlers.reap import reap_loop
 from .handlers.status_polling import status_poll_loop
-from .scheduler import scheduled_jobs_loop
+from .scheduler import forget_closed_topic, scheduled_jobs_loop
 from .screenshot import text_to_image
 from .session import session_manager
 from .token_usage import read_usage
@@ -645,11 +645,13 @@ async def topic_closed_handler(
     """Handle topic closure — end the session the topic was holding.
 
     Never starts a chained job, so closing old topics in bulk sets nothing off.
+    A job's closed topic is done with, so its next run makes a new one.
     """
     thread_id = _get_thread_id(update)
     if thread_id is None:
         return
     await end_session(context.bot, thread_id, context.user_data)
+    forget_closed_topic(thread_id)
 
 
 async def topic_edited_handler(

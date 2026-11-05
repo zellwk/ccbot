@@ -1,7 +1,8 @@
 """Tests for a job's standing topic and the chain that follows its report.
 
-A job reuses one topic for every run, so a run has to find that topic in
-whatever state it was left: open, closed or deleted. The chain to a job's
+A job reuses one open topic for every run. A closed topic is done with and a
+deleted one is unreachable, so either gets a new topic, and the closed one is
+never reopened. The chain to a job's
 followers fires only from a delivered report and at most once a day. A chain
 fired twice works the same customer case twice, so each trigger that must stay
 silent is pinned here.
@@ -15,7 +16,7 @@ import pytest
 from telegram.error import BadRequest
 
 from ccbot import scheduler
-from ccbot.handlers import cleanup, reap
+from ccbot.handlers import cleanup
 from ccbot.scheduler import JobReport
 from ccbot.session import SessionManager
 
@@ -43,7 +44,10 @@ ACTION = {
 
 
 class ForumBot:
-    """A forum where each topic is open, closed or gone, as Telegram reports it."""
+    """A forum where each topic is open, closed or gone, as Telegram reports it.
+
+    An admin bot can still post in a closed topic, so only a gone one rejects sends.
+    """
 
     def __init__(self) -> None:
         self.topics: dict[int, str] = {}
@@ -58,16 +62,14 @@ class ForumBot:
         return SimpleNamespace(message_thread_id=self.next_thread)
 
     async def reopen_forum_topic(self, chat_id: int, message_thread_id: int) -> bool:
-        state = self.topics.get(message_thread_id, "gone")
-        if state == "gone":
-            raise BadRequest("Bad Request: TOPIC_ID_INVALID")
-        if state == "open":
-            raise BadRequest("Bad Request: TOPIC_NOT_MODIFIED")
-        self.topics[message_thread_id] = "open"
+        self.topics[message_thread_id] = "reopened"
         return True
 
     async def send_message(self, chat_id: int, text: str, **kwargs) -> None:
-        self.sent.append((kwargs["message_thread_id"], text))
+        thread = kwargs["message_thread_id"]
+        if thread not in self.topics:
+            raise BadRequest("Message thread not found")
+        self.sent.append((thread, text))
 
 
 class FakeTmux:
@@ -97,7 +99,7 @@ def env(monkeypatch, tmp_path):
     monkeypatch.setattr(SessionManager, "_save_state", lambda self: None)
     mgr = SessionManager()
     tmux = FakeTmux()
-    for module in (scheduler, cleanup, reap):
+    for module in (scheduler, cleanup):
         monkeypatch.setattr(module, "session_manager", mgr)
     monkeypatch.setattr(scheduler, "tmux_manager", tmux)
     monkeypatch.setattr(cleanup, "tmux_manager", tmux)
@@ -140,13 +142,22 @@ class TestStandingTopic:
         assert env.bot.created == ["S"]
         assert {thread for thread, _ in env.bot.sent} == {501}
 
-    async def test_closed_topic_is_reopened_and_reused(self, env) -> None:
+    async def test_closed_topic_is_left_and_replaced(self, env) -> None:
         await run(env.bot, SUPPORT)
         env.bot.topics[501] = "closed"
+        scheduler.forget_closed_topic(501)  # what topic_closed_handler does
+
         await run(env.bot, SUPPORT)
-        assert env.bot.created == ["S"]
-        assert env.bot.topics[501] == "open"
-        assert env.bot.sent[-1][0] == 501
+
+        assert env.bot.created == ["S", "S"]
+        assert stored_topics(env) == {"fake-support": 502}
+        assert env.bot.topics[501] == "closed"
+        assert [thread for thread, _ in env.bot.sent].count(501) == 2  # first run only
+
+    async def test_closing_a_topic_no_job_owns_changes_nothing(self, env) -> None:
+        await run(env.bot, SUPPORT)
+        scheduler.forget_closed_topic(999)
+        assert stored_topics(env) == {"fake-support": 501}
 
     async def test_deleted_topic_is_replaced(self, env) -> None:
         await run(env.bot, SUPPORT)

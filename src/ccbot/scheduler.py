@@ -8,8 +8,13 @@ conversation that already did the work rather than repeating it.
 
 Each job owns one standing topic, named by its ``topic`` field and reused on every
 run. ``jobs-topics.json`` maps job name to thread. A run ends the session the
-topic still holds from last time, then binds its own; the topic itself stays. A
-topic that was closed is reopened, and one that was deleted is made again.
+topic still holds from last time, then binds its own; the topic itself stays.
+
+Closing a topic means it is done with. ``topic_closed_handler`` drops the job's
+entry, and the next run makes a new topic, leaving the closed one as it is.
+Nothing probes a topic for its state: the one call that reveals it reopens a
+closed topic as it asks. A deleted topic shows when the report's send fails,
+and the report goes to a new topic instead.
 
 ``when`` names a shell command that decides due-ness before the headless pass runs.
 Exit 0 opens the gate, anything else ends the job. It exists because a headless pass
@@ -64,8 +69,7 @@ from telegram import Bot
 
 from .config import config
 from .handlers.cleanup import end_session
-from .handlers.message_sender import safe_send
-from .handlers.reap import topic_verdict
+from .handlers.message_sender import DeadThread, safe_send
 from .session import session_manager
 from .telegram_sender import split_message
 from .tmux_manager import tmux_manager
@@ -205,17 +209,23 @@ async def _open_session_for_job(bot: Bot, job: dict[str, Any]) -> None:
 
     user_id = next(iter(config.allowed_users))
     chat_id = config.forum_chat_id or session_manager.resolve_chat_id(user_id)
-    thread_id = await _standing_topic(bot, job, user_id, chat_id)
+    thread_id = _job_topics().get(job["name"])
+    if thread_id is None:
+        thread_id = await _new_topic(bot, job, user_id, chat_id)
     # Last run's session ends only now, when the next run replaces it. A reply
     # sent between runs still reaches it.
     await end_session(bot, thread_id)
 
     # Posted before the window exists. The report is the thing worth delivering, and
-    # a window that fails to open must not take the findings down with it. Split with
-    # room for MarkdownV2 escaping, as response_builder does: sent whole, a report past
-    # Telegram's limit fails outright and leaves the topic empty.
-    for chunk in split_message(report.text, max_length=3000):
-        await safe_send(bot, chat_id, chunk, message_thread_id=thread_id)
+    # a window that fails to open must not take the findings down with it.
+    try:
+        await _post_report(bot, chat_id, thread_id, report)
+    except DeadThread:
+        logger.info(
+            "Job %s: topic %d is gone, making a new one", job["name"], thread_id
+        )
+        thread_id = await _new_topic(bot, job, user_id, chat_id)
+        await _post_report(bot, chat_id, thread_id, report)
 
     # The report has landed, so this run is done as far as its followers care.
     # A task of their own, because each works headless for minutes and the
@@ -327,23 +337,8 @@ def _job_env() -> dict[str, str]:
     return env
 
 
-async def _standing_topic(
-    bot: Bot, job: dict[str, Any], user_id: int, chat_id: int
-) -> int:
-    """The job's own topic, reopened if closed and made anew if deleted.
-
-    The probe that tells the two apart reopens a closed topic as it asks, so a
-    topic that answers "closed" is already open again by the time it returns.
-    """
-    thread_id = _job_topics().get(job["name"])
-    if thread_id is not None:
-        verdict = await topic_verdict(bot, user_id, thread_id)
-        if verdict != "gone":
-            return thread_id
-        logger.info(
-            "Job %s: topic %d is gone, making a new one", job["name"], thread_id
-        )
-
+async def _new_topic(bot: Bot, job: dict[str, Any], user_id: int, chat_id: int) -> int:
+    """Makes the job's topic and stores it as the one its runs reuse."""
     topic = await bot.create_forum_topic(chat_id=chat_id, name=job["topic"])
     thread_id = topic.message_thread_id
     # Nothing has arrived from this topic yet, so record where it lives now.
@@ -351,6 +346,19 @@ async def _standing_topic(
     session_manager.set_group_chat_id(user_id, thread_id, chat_id)
     _remember_job_topic(job["name"], thread_id)
     return thread_id
+
+
+async def _post_report(
+    bot: Bot, chat_id: int, thread_id: int, report: JobReport
+) -> None:
+    """Posts the report in chunks. Raises DeadThread when the topic is gone.
+
+    Split with room for MarkdownV2 escaping, as response_builder does: sent
+    whole, a report past Telegram's limit fails outright and leaves the topic
+    empty.
+    """
+    for chunk in split_message(report.text, max_length=3000):
+        await safe_send(bot, chat_id, chunk, message_thread_id=thread_id)
 
 
 async def _start_followers(bot: Bot, job: dict[str, Any]) -> None:
@@ -400,6 +408,17 @@ def _job_topics() -> dict[str, int]:
     if not path.exists():
         return {}
     return json.loads(path.read_text())
+
+
+def forget_closed_topic(thread_id: int) -> None:
+    """Drops the job whose topic this was, so its next run makes a new one.
+
+    Called when a topic closes. A thread that belongs to no job changes nothing.
+    """
+    topics = _job_topics()
+    kept = {name: tid for name, tid in topics.items() if tid != thread_id}
+    if kept != topics:
+        atomic_write_json(_job_topics_path(), kept)
 
 
 def _remember_job_topic(name: str, thread_id: int) -> None:

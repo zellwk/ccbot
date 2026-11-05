@@ -9,7 +9,7 @@ give is pinned to the verdict it produces.
 import pytest
 from telegram.error import BadRequest, RetryAfter
 
-from ccbot.handlers.reap import topic_verdict
+from ccbot.handlers.reap import _topic_verdict
 
 USER = 100
 THREAD = 42
@@ -32,35 +32,35 @@ class ReopenBot:
 @pytest.mark.asyncio
 async def test_deleted_topic_reads_as_gone():
     bot = ReopenBot(BadRequest("Bad Request: TOPIC_ID_INVALID"))
-    assert await topic_verdict(bot, USER, THREAD) == "gone"
+    assert await _topic_verdict(bot, USER, THREAD) == "gone"
 
 
 @pytest.mark.asyncio
 async def test_open_topic_is_kept():
     bot = ReopenBot(BadRequest("Bad Request: TOPIC_NOT_MODIFIED"))
-    assert await topic_verdict(bot, USER, THREAD) == "keep"
+    assert await _topic_verdict(bot, USER, THREAD) == "keep"
 
 
 @pytest.mark.asyncio
 async def test_rate_limit_kills_nothing():
     bot = ReopenBot(RetryAfter(30))
-    assert await topic_verdict(bot, USER, THREAD) == "keep"
+    assert await _topic_verdict(bot, USER, THREAD) == "keep"
 
 
 @pytest.mark.asyncio
 async def test_unrecognised_rejection_kills_nothing():
     bot = ReopenBot(BadRequest("Bad Request: CHAT_ADMIN_REQUIRED"))
-    assert await topic_verdict(bot, USER, THREAD) == "keep"
+    assert await _topic_verdict(bot, USER, THREAD) == "keep"
 
 
 @pytest.mark.asyncio
 async def test_success_means_the_topic_was_closed():
     bot = ReopenBot()
-    assert await topic_verdict(bot, USER, THREAD) == "closed"
+    assert await _topic_verdict(bot, USER, THREAD) == "closed"
 
 
 @pytest.mark.asyncio
 async def test_probe_asks_once_per_thread():
     bot = ReopenBot(BadRequest("Bad Request: TOPIC_ID_INVALID"))
-    await topic_verdict(bot, USER, THREAD)
+    await _topic_verdict(bot, USER, THREAD)
     assert bot.calls == 1
