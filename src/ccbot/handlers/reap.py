@@ -87,7 +87,7 @@ async def reap_dead_topics(bot: Bot) -> int:
         probes += 1
 
         user_id, thread_id = binding
-        verdict = await _topic_verdict(bot, user_id, thread_id)
+        verdict = await topic_verdict(bot, user_id, thread_id)
         if verdict == "gone":
             await _reap_window(
                 bot, window_id, user_id, thread_id, "topic no longer exists"
@@ -115,7 +115,7 @@ async def reap_loop(bot: Bot) -> None:
             logger.exception("Reap pass failed")
 
 
-async def _topic_verdict(bot: Bot, user_id: int, thread_id: int) -> TopicVerdict:
+async def topic_verdict(bot: Bot, user_id: int, thread_id: int) -> TopicVerdict:
     """Ask Telegram what became of a topic, changing nothing.
 
     "keep" covers every answer that is not a clear death, including a rate

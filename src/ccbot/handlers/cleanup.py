@@ -5,6 +5,7 @@ all modules, preventing memory leaks when topics are deleted.
 
 Functions:
   - clear_topic_state: Clean up all memory state for a specific topic
+  - end_session: End the session a topic holds, leaving the topic itself alone
   - close_topic: Close the Telegram topic whose session has ended
 """
 
@@ -14,6 +15,7 @@ from typing import Any
 from telegram import Bot
 
 from ..session import session_manager
+from ..tmux_manager import tmux_manager
 from .interactive_ui import clear_interactive_msg
 from .message_queue import clear_status_msg_info, clear_tool_msg_ids_for_topic
 
@@ -52,6 +54,51 @@ async def clear_topic_state(
         if user_data.get("_pending_thread_id") == thread_id:
             user_data.pop("_pending_thread_id", None)
             user_data.pop("_pending_thread_text", None)
+
+
+async def end_session(
+    bot: Bot, thread_id: int, user_data: dict[str, Any] | None = None
+) -> None:
+    """LOCAL PATCH: end the session a topic holds. The topic itself stays.
+
+    Killing the window is what ends a session; dropping the binding and clearing
+    the topic's memory state follow from it. A closed topic, /done and a job's
+    next run all arrive here, so none grows its own version of the teardown.
+
+    The binding goes before the window dies. The status poller closes the topic
+    of any binding whose window is gone, so the other order lets it close a
+    job's standing topic in the moment between the two.
+
+    The binding is read by thread rather than by the acting user. ccbot ends
+    sessions itself, and the service message for a close it authored carries
+    the bot as its sender.
+    """
+    binding = session_manager.get_binding_for_thread(thread_id)
+    if not binding:
+        logger.debug("Session ended: no binding (thread=%d)", thread_id)
+        return
+
+    user_id, window_id = binding
+    display = session_manager.get_display_name(window_id)
+    session_manager.unbind_thread(user_id, thread_id)
+    await clear_topic_state(user_id, thread_id, bot, user_data)
+
+    window = await tmux_manager.find_window_by_id(window_id)
+    if window:
+        await tmux_manager.kill_window(window.window_id)
+        logger.info(
+            "Session ended: killed window %s (user=%d, thread=%d)",
+            display,
+            user_id,
+            thread_id,
+        )
+    else:
+        logger.info(
+            "Session ended: window %s already gone (user=%d, thread=%d)",
+            display,
+            user_id,
+            thread_id,
+        )
 
 
 async def close_topic(bot: Bot, user_id: int, thread_id: int) -> None:

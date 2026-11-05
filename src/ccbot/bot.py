@@ -108,7 +108,7 @@ from .handlers.directory_browser import (
     clear_session_picker_state,
     clear_window_picker_state,
 )
-from .handlers.cleanup import clear_topic_state
+from .handlers.cleanup import clear_topic_state, end_session
 from .handlers.history import send_history
 from .rename_echo import consume_rename_echo
 from .handlers.interactive_ui import (
@@ -139,7 +139,7 @@ from .markdown_v2 import convert_markdown
 from .handlers.response_builder import build_response_parts
 from .handlers.reap import reap_loop
 from .handlers.status_polling import status_poll_loop
-from .scheduler import open_next_job, scheduled_jobs_loop
+from .scheduler import scheduled_jobs_loop
 from .screenshot import text_to_image
 from .session import session_manager
 from .token_usage import read_usage
@@ -406,9 +406,9 @@ async def done_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     """LOCAL PATCH: end this topic's session and clear the topic away.
 
     Closing a topic ends the session it held. /done does that and deletes the
-    topic too, so a finished thread doesn't have to be tidied up by hand. Any
-    job chained after this one opens in a topic of its own, as it would on a
-    close. Works in any topic — a job is an add-on, not a requirement.
+    topic too, so a finished thread doesn't have to be tidied up by hand. It
+    never starts a chained job — only a job's delivered report does that.
+    Works in any topic. A job's next run makes its topic again.
     """
     user = update.effective_user
     if not user or not is_user_allowed(user.id):
@@ -642,74 +642,14 @@ def _build_screenshot_keyboard(window_id: str) -> InlineKeyboardMarkup:
 async def topic_closed_handler(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
-    """Handle topic closure — end the session the topic was holding."""
+    """Handle topic closure — end the session the topic was holding.
+
+    Never starts a chained job, so closing old topics in bulk sets nothing off.
+    """
     thread_id = _get_thread_id(update)
     if thread_id is None:
         return
     await end_session(context.bot, thread_id, context.user_data)
-
-
-async def end_session(
-    bot: Bot, thread_id: int, user_data: dict[str, Any] | None = None
-) -> None:
-    """LOCAL PATCH: end the session a topic holds, and start any job after it.
-
-    Killing the window is what ends a session; dropping the binding, clearing
-    the topic's memory state and chaining the next job all follow from it. A
-    closed topic and /done both arrive here, so neither grows its own version
-    of the teardown.
-
-    The binding is read by thread rather than by the acting user. ccbot ends
-    sessions itself, and the service message for a close it authored carries
-    the bot as its sender.
-    """
-    binding = session_manager.get_binding_for_thread(thread_id)
-    if binding:
-        user_id, window_id = binding
-        display = session_manager.get_display_name(window_id)
-        window = await tmux_manager.find_window_by_id(window_id)
-        if window:
-            await tmux_manager.kill_window(window.window_id)
-            logger.info(
-                "Session ended: killed window %s (user=%d, thread=%d)",
-                display,
-                user_id,
-                thread_id,
-            )
-        else:
-            logger.info(
-                "Session ended: window %s already gone (user=%d, thread=%d)",
-                display,
-                user_id,
-                thread_id,
-            )
-        session_manager.unbind_thread(user_id, thread_id)
-        await clear_topic_state(user_id, thread_id, bot, user_data)
-    else:
-        logger.debug("Session ended: no binding (thread=%d)", thread_id)
-
-    # A job's topic ending is the signal that its stage is done, so each job
-    # chained after it starts in a topic of its own. Chained jobs work headless
-    # for minutes, so they run as their own task: awaited here, they hold every
-    # update behind this one, including the next /done, until they finish.
-    asyncio.create_task(_chain_next_jobs(bot, thread_id))
-
-
-async def _chain_next_jobs(bot: Bot, thread_id: int) -> None:
-    """LOCAL PATCH: start the jobs chained after the one that owned the topic.
-
-    A failure here must not stop the topic from going.
-    """
-    try:
-        started = await open_next_job(bot, thread_id)
-        if started:
-            logger.info(
-                "Session ended: chained to jobs %s (thread=%d)",
-                ", ".join(started),
-                thread_id,
-            )
-    except Exception:
-        logger.exception("Session ended: chaining next job failed")
 
 
 async def topic_edited_handler(

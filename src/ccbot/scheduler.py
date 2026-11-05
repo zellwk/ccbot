@@ -1,10 +1,15 @@
-"""Scheduled jobs — works the job headless, then opens a topic only if it has something.
+"""Scheduled jobs — works each job headless, and posts only when it has something.
 
 A job is worked by ``claude -p`` first, with nothing on Telegram. When that pass
-reports nothing, the job ends there: no topic, no notification, no tmux window to
-close by hand. When it does have something, the topic opens, the report is posted,
-and the window resumes that same session — so a reply lands in the conversation that
-already did the work rather than repeating it.
+reports nothing, the job ends there: no post, no notification, no tmux window to
+close by hand. When it does have something, the report is posted in the job's
+topic and a window resumes that same session — so a reply lands in the
+conversation that already did the work rather than repeating it.
+
+Each job owns one standing topic, named by its ``topic`` field and reused on every
+run. ``jobs-topics.json`` maps job name to thread. A run ends the session the
+topic still holds from last time, then binds its own; the topic itself stays. A
+topic that was closed is reopened, and one that was deleted is made again.
 
 ``when`` names a shell command that decides due-ness before the headless pass runs.
 Exit 0 opens the gate, anything else ends the job. It exists because a headless pass
@@ -34,15 +39,17 @@ Job shape::
 ``machines`` lists the roles this job runs on, matched against ``~/.claude/.machine``
 — ``headless`` on the Mac mini, ``main`` on the laptop. Omit it to run everywhere.
 
-``next`` names a job, or a list of jobs, to start when ``/done`` is sent in this
-job's topic, which is how a stage says it is finished. A list opens one topic per
-follower, in order. Each follower needs no ``at`` and should carry
-``"enabled": false`` so the clock never starts it on its own — chaining calls it
-directly. Chains can run any depth: triage → support → action.
+``next`` names a job, or a list of jobs, to start once this job's report has been
+posted. That delivery is the chain's one trigger. Closing a topic, ``/done``, a
+reap or a killed window never starts a follower, so tidying old topics sets
+nothing off. A list runs its followers one after another, each in its own topic.
+Each follower needs no ``at`` and should carry ``"enabled": false`` so the clock
+never starts it on its own — chaining calls it directly. Chains can run any
+depth: triage → support → action.
 
-``/done`` rather than closing the topic because a private chat is not a forum:
-Telegram sends no ``forum_topic_closed`` update there, so nothing observes a
-topic closing. ``topic_closed_handler`` chains too, for a supergroup setup.
+A follower runs at most once a day. Its date is claimed in ``jobs-fired.json``
+before it starts, so a second trigger the same day finds it taken. A pass that
+fails or finds nothing posts no report, and starts no follower.
 """
 
 import asyncio
@@ -56,7 +63,9 @@ from typing import Any, NamedTuple
 from telegram import Bot
 
 from .config import config
+from .handlers.cleanup import end_session
 from .handlers.message_sender import safe_send
+from .handlers.reap import topic_verdict
 from .session import session_manager
 from .telegram_sender import split_message
 from .tmux_manager import tmux_manager
@@ -101,11 +110,13 @@ class JobReport(NamedTuple):
     """A headless pass's report, and the session a reply can carry on in.
 
     ``session_id`` is empty when the pass left nothing resumable — a timeout or a
-    crash — and the topic then opens on a fresh session.
+    crash — and the topic then opens on a fresh session. ``failed`` marks the
+    notice posted in place of a report, which starts no follower.
     """
 
     text: str
     session_id: str
+    failed: bool = False
 
 
 async def scheduled_jobs_loop(bot: Bot) -> None:
@@ -182,7 +193,7 @@ def _due_jobs(
 
 
 async def _open_session_for_job(bot: Bot, job: dict[str, Any]) -> None:
-    """Works the job headless, and opens a topic only when it has something to say."""
+    """Works the job headless, and posts in its topic only when it has something."""
     if not await _is_gate_open(job):
         logger.info("Job %s: gate closed, nothing opened", job["name"])
         return
@@ -194,13 +205,10 @@ async def _open_session_for_job(bot: Bot, job: dict[str, Any]) -> None:
 
     user_id = next(iter(config.allowed_users))
     chat_id = config.forum_chat_id or session_manager.resolve_chat_id(user_id)
-    title = f"{job['topic']} · {datetime.now():%b %d}"
-
-    topic = await bot.create_forum_topic(chat_id=chat_id, name=title)
-    thread_id = topic.message_thread_id
-    # Nothing has arrived from this topic yet, so record where it lives now.
-    # Every outbound call for the thread resolves through this mapping.
-    session_manager.set_group_chat_id(user_id, thread_id, chat_id)
+    thread_id = await _standing_topic(bot, job, user_id, chat_id)
+    # Last run's session ends only now, when the next run replaces it. A reply
+    # sent between runs still reaches it.
+    await end_session(bot, thread_id)
 
     # Posted before the window exists. The report is the thing worth delivering, and
     # a window that fails to open must not take the findings down with it. Split with
@@ -208,6 +216,12 @@ async def _open_session_for_job(bot: Bot, job: dict[str, Any]) -> None:
     # Telegram's limit fails outright and leaves the topic empty.
     for chunk in split_message(report.text, max_length=3000):
         await safe_send(bot, chat_id, chunk, message_thread_id=thread_id)
+
+    # The report has landed, so this run is done as far as its followers care.
+    # A task of their own, because each works headless for minutes and the
+    # clock must keep ticking for every other job meanwhile.
+    if not report.failed and job.get("next"):
+        asyncio.create_task(_start_followers(bot, job))
 
     # The work is already done, so the window carries on that same session rather
     # than starting cold and being asked the same question twice.
@@ -229,7 +243,6 @@ async def _open_session_for_job(bot: Bot, job: dict[str, Any]) -> None:
     # topic_namer.maybe_autoname() checks before it renames anything, so the
     # local model leaves these rooms alone.
     session_manager.mark_auto_named(window_id, True)
-    _remember_job_topic(thread_id, job["name"])
 
     logger.info(
         "Job %s: reported in topic %d (window %s)", job["name"], thread_id, window_id
@@ -282,7 +295,7 @@ async def _get_job_report(job: dict[str, Any]) -> JobReport | None:
     except TimeoutError:
         proc.kill()
         logger.error("Job %s: headless pass timed out", job["name"])
-        return JobReport(f"❌ {job['name']}: timed out before it reported.", "")
+        return JobReport(f"❌ {job['name']}: timed out before it reported.", "", True)
 
     if proc.returncode != 0:
         logger.error(
@@ -291,7 +304,7 @@ async def _get_job_report(job: dict[str, Any]) -> JobReport | None:
             proc.returncode,
             stderr.decode().strip()[-500:],
         )
-        return JobReport(f"❌ {job['name']}: the headless pass failed.", "")
+        return JobReport(f"❌ {job['name']}: the headless pass failed.", "", True)
 
     result = json.loads(stdout)
     logger.info(
@@ -314,57 +327,85 @@ def _job_env() -> dict[str, str]:
     return env
 
 
-async def open_next_job(bot: Bot, thread_id: int) -> list[str]:
-    """Opens the jobs chained after the one that owns ``thread_id``.
+async def _standing_topic(
+    bot: Bot, job: dict[str, Any], user_id: int, chat_id: int
+) -> int:
+    """The job's own topic, reopened if closed and made anew if deleted.
 
-    Called when a topic closes. Returns the names of the jobs it started —
-    empty when this topic came from no job, or that job names no successor.
+    The probe that tells the two apart reopens a closed topic as it asks, so a
+    topic that answers "closed" is already open again by the time it returns.
     """
-    name = _job_topics().get(str(thread_id))
-    _forget_job_topic(thread_id)
-    if not name:
-        return []
+    thread_id = _job_topics().get(job["name"])
+    if thread_id is not None:
+        verdict = await topic_verdict(bot, user_id, thread_id)
+        if verdict != "gone":
+            return thread_id
+        logger.info(
+            "Job %s: topic %d is gone, making a new one", job["name"], thread_id
+        )
 
-    job = next((j for j in _load_jobs() if j["name"] == name), None)
-    nxt = job and job.get("next")
-    if not nxt:
-        return []
+    topic = await bot.create_forum_topic(chat_id=chat_id, name=job["topic"])
+    thread_id = topic.message_thread_id
+    # Nothing has arrived from this topic yet, so record where it lives now.
+    # Every outbound call for the thread resolves through this mapping.
+    session_manager.set_group_chat_id(user_id, thread_id, chat_id)
+    _remember_job_topic(job["name"], thread_id)
+    return thread_id
+
+
+async def _start_followers(bot: Bot, job: dict[str, Any]) -> None:
+    """Runs the jobs chained after ``job``, in order, each at most once a day.
+
+    A failure here must not reach the scheduler's tick.
+    """
+    nxt = job["next"]
     followers = [nxt] if isinstance(nxt, str) else list(nxt)
-
-    started = []
     jobs = _load_jobs()
-    for follower_name in followers:
-        follower = next((j for j in jobs if j["name"] == follower_name), None)
-        if not follower:
-            logger.error("Job %s: next job %r not found", name, follower_name)
-            continue
-        await _open_session_for_job(bot, follower)
-        started.append(follower_name)
-    return started
+    try:
+        for name in followers:
+            follower = next((j for j in jobs if j["name"] == name), None)
+            if not follower:
+                logger.error("Job %s: next job %r not found", job["name"], name)
+                continue
+            if not _claim_today(name):
+                logger.warning(
+                    "Job %s: next job %s already ran today, not starting it again",
+                    job["name"],
+                    name,
+                )
+                continue
+            logger.info("Job %s: chaining to %s", job["name"], name)
+            await _open_session_for_job(bot, follower)
+    except Exception:
+        logger.exception("Job %s: chaining failed", job["name"])
 
 
-def job_name_for_topic(thread_id: int) -> str | None:
-    """Name of the job whose topic this is, or None when it came from no job."""
-    return _job_topics().get(str(thread_id))
+def _claim_today(name: str) -> bool:
+    """Records today as ``name``'s run date. False when today is already taken.
+
+    Read and written with no await between, so two triggers on the one event
+    loop cannot both claim the same day.
+    """
+    fired = _load_fired_dates()
+    today = datetime.now().date().isoformat()
+    if fired.get(name) == today:
+        return False
+    fired[name] = today
+    atomic_write_json(_fired_path(), fired)
+    return True
 
 
-def _job_topics() -> dict[str, str]:
+def _job_topics() -> dict[str, int]:
     path = _job_topics_path()
     if not path.exists():
         return {}
     return json.loads(path.read_text())
 
 
-def _remember_job_topic(thread_id: int, name: str) -> None:
+def _remember_job_topic(name: str, thread_id: int) -> None:
     topics = _job_topics()
-    topics[str(thread_id)] = name
+    topics[name] = thread_id
     atomic_write_json(_job_topics_path(), topics)
-
-
-def _forget_job_topic(thread_id: int) -> None:
-    topics = _job_topics()
-    if topics.pop(str(thread_id), None) is not None:
-        atomic_write_json(_job_topics_path(), topics)
 
 
 def _job_topics_path() -> Path:
