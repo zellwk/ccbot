@@ -527,3 +527,16 @@ class TestParseEntries:
         result, pending = TranscriptParser.parse_entries(entries)
         user_entries = [e for e in result if e.role == "user"]
         assert len(user_entries) == 0
+
+    def test_synthetic_resume_turn_filtered(self, make_jsonl_entry, make_text_block):
+        entry = make_jsonl_entry("assistant", [make_text_block("No response requested.")])
+        entry["message"]["model"] = "<synthetic>"
+        result, pending = TranscriptParser.parse_entries([entry])
+        assert result == []
+
+    def test_synthetic_api_error_kept(self, make_jsonl_entry, make_text_block):
+        entry = make_jsonl_entry("assistant", [make_text_block("API Error: 529")])
+        entry["message"]["model"] = "<synthetic>"
+        entry["isApiErrorMessage"] = True
+        result, pending = TranscriptParser.parse_entries([entry])
+        assert [e.text for e in result if e.role == "assistant"] == ["API Error: 529"]

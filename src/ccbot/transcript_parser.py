@@ -461,6 +461,15 @@ class TranscriptParser:
             message = data.get("message")
             if not isinstance(message, dict):
                 continue
+            # Claude Code writes a "<synthetic>" assistant turn of its own when it
+            # resumes a session that ended mid-turn ("No response requested.").
+            # Nobody said it, so it stays out of Telegram. API errors share the
+            # model name but carry isApiErrorMessage, and those still go through.
+            if (
+                message.get("model") == "<synthetic>"
+                and not data.get("isApiErrorMessage")
+            ):
+                continue
             content = message.get("content", "")
             if not isinstance(content, list):
                 content = [{"type": "text", "text": str(content)}] if content else []
