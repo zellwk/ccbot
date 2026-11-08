@@ -6,12 +6,14 @@ close by hand. When it does have something, the report is posted in the job's
 topic and a window resumes that same session — so a reply lands in the
 conversation that already did the work rather than repeating it.
 
-Each job owns one standing topic, named by its ``topic`` field and reused on every
-run. ``jobs-topics.json`` maps job name to thread. A run ends the session the
-topic still holds from last time, then binds its own; the topic itself stays.
+Each job posts in one standing topic, named by its ``topic`` field and reused on
+every run. Jobs that give the same ``topic`` share it, so related reports land in
+one chat. ``jobs-topics.json`` maps topic name to thread. A run ends the session
+the topic still holds from last time, then binds its own; the topic itself stays.
+In a shared topic that means a reply reaches whichever of its jobs ran last.
 
-Closing a topic means it is done with. ``topic_closed_handler`` drops the job's
-entry, and the next run makes a new topic, leaving the closed one as it is.
+Closing a topic means it is done with. ``topic_closed_handler`` drops its entry,
+and the next run makes a new topic, leaving the closed one as it is.
 Nothing probes a topic for its state: the one call that reveals it reopens a
 closed topic as it asks. A deleted topic shows when the report's send fails,
 and the report goes to a new topic instead.
@@ -209,7 +211,7 @@ async def _open_session_for_job(bot: Bot, job: dict[str, Any]) -> None:
 
     user_id = next(iter(config.allowed_users))
     chat_id = config.forum_chat_id or session_manager.resolve_chat_id(user_id)
-    thread_id = _job_topics().get(job["name"])
+    thread_id = _job_topics().get(job["topic"])
     if thread_id is None:
         thread_id = await _new_topic(bot, job, user_id, chat_id)
     # Last run's session ends only now, when the next run replaces it. A reply
@@ -338,13 +340,13 @@ def _job_env() -> dict[str, str]:
 
 
 async def _new_topic(bot: Bot, job: dict[str, Any], user_id: int, chat_id: int) -> int:
-    """Makes the job's topic and stores it as the one its runs reuse."""
+    """Makes the job's topic and stores it as the one every job naming it reuses."""
     topic = await bot.create_forum_topic(chat_id=chat_id, name=job["topic"])
     thread_id = topic.message_thread_id
     # Nothing has arrived from this topic yet, so record where it lives now.
     # Every outbound call for the thread resolves through this mapping.
     session_manager.set_group_chat_id(user_id, thread_id, chat_id)
-    _remember_job_topic(job["name"], thread_id)
+    _remember_job_topic(job["topic"], thread_id)
     return thread_id
 
 
@@ -411,7 +413,7 @@ def _job_topics() -> dict[str, int]:
 
 
 def forget_closed_topic(thread_id: int) -> None:
-    """Drops the job whose topic this was, so its next run makes a new one.
+    """Drops the topic this thread was, so the next run naming it makes a new one.
 
     Called when a topic closes. A thread that belongs to no job changes nothing.
     """

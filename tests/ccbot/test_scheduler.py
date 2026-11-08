@@ -131,16 +131,24 @@ def stored_topics(env) -> dict[str, int]:
 
 
 class TestStandingTopic:
-    async def test_first_run_makes_the_topic_under_the_jobs_name(self, env) -> None:
+    async def test_first_run_makes_the_topic_under_its_name(self, env) -> None:
         await run(env.bot, SUPPORT)
         assert env.bot.created == ["S"]
-        assert stored_topics(env) == {"fake-support": 501}
+        assert stored_topics(env) == {"S": 501}
 
     async def test_open_topic_is_reused(self, env) -> None:
         await run(env.bot, SUPPORT)
         await run(env.bot, SUPPORT)
         assert env.bot.created == ["S"]
         assert {thread for thread, _ in env.bot.sent} == {501}
+
+    async def test_jobs_naming_the_same_topic_share_it(self, env) -> None:
+        sibling = {**SUPPORT, "name": "fake-sibling"}
+        await run(env.bot, SUPPORT)
+        await run(env.bot, sibling)
+        assert env.bot.created == ["S"]
+        assert {thread for thread, _ in env.bot.sent} == {501}
+        assert stored_topics(env) == {"S": 501}
 
     async def test_closed_topic_is_left_and_replaced(self, env) -> None:
         await run(env.bot, SUPPORT)
@@ -150,21 +158,21 @@ class TestStandingTopic:
         await run(env.bot, SUPPORT)
 
         assert env.bot.created == ["S", "S"]
-        assert stored_topics(env) == {"fake-support": 502}
+        assert stored_topics(env) == {"S": 502}
         assert env.bot.topics[501] == "closed"
         assert [thread for thread, _ in env.bot.sent].count(501) == 2  # first run only
 
     async def test_closing_a_topic_no_job_owns_changes_nothing(self, env) -> None:
         await run(env.bot, SUPPORT)
         scheduler.forget_closed_topic(999)
-        assert stored_topics(env) == {"fake-support": 501}
+        assert stored_topics(env) == {"S": 501}
 
     async def test_deleted_topic_is_replaced(self, env) -> None:
         await run(env.bot, SUPPORT)
         del env.bot.topics[501]
         await run(env.bot, SUPPORT)
         assert env.bot.created == ["S", "S"]
-        assert stored_topics(env) == {"fake-support": 502}
+        assert stored_topics(env) == {"S": 502}
         assert env.bot.sent[-1][0] == 502
 
     async def test_last_runs_session_ends_and_the_topic_stays(self, env) -> None:
@@ -202,7 +210,7 @@ class TestChain:
 
     async def test_ending_the_triage_session_starts_no_follower(self, env) -> None:
         """Closing a topic, /done and a reap all end a session through here."""
-        (env.dir / "jobs-topics.json").write_text(json.dumps({"fake-triage": 501}))
+        (env.dir / "jobs-topics.json").write_text(json.dumps({"Fake triage": 501}))
         env.tmux.live.add("@9")
         env.mgr.bind_thread(12345, 501, "@9")
 
