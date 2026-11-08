@@ -131,6 +131,47 @@ def _install_hook() -> int:
     return 0
 
 
+def _process_table() -> dict[int, tuple[int, str]]:
+    """Maps every running pid to its parent pid and command name."""
+    result = subprocess.run(
+        ["ps", "-axo", "pid=,ppid=,comm="],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    table: dict[int, tuple[int, str]] = {}
+    for line in result.stdout.splitlines():
+        fields = line.split(None, 2)
+        if len(fields) == 3 and fields[0].isdigit() and fields[1].isdigit():
+            table[int(fields[0])] = (int(fields[1]), fields[2])
+    return table
+
+
+def _is_nested_claude(
+    start_pid: int, pane_pid: int, table: dict[int, tuple[int, str]]
+) -> bool:
+    """Whether the Claude that fired this hook was started by another Claude.
+
+    A `claude -p` run from a session's Bash tool inherits the pane's
+    TMUX_PANE. Mapping it would point the window at a throwaway session,
+    and the bridge would stop forwarding the real session's replies.
+    So count Claude processes from the hook up to the pane's own process:
+    more than one means this session runs inside another.
+    """
+    claudes = 0
+    pid = start_pid
+    seen: set[int] = set()
+    while pid in table and pid not in seen:
+        seen.add(pid)
+        ppid, comm = table[pid]
+        if os.path.basename(comm) == "claude":
+            claudes += 1
+        if pid == pane_pid:
+            break
+        pid = ppid
+    return claudes > 1
+
+
 def hook_main() -> None:
     """Process a Claude Code hook event from stdin, or install the hook."""
     # Configure logging for the hook subprocess (main.py logging doesn't apply here)
@@ -200,22 +241,31 @@ def hook_main() -> None:
             "-t",
             pane_id,
             "-p",
-            "#{session_name}:#{window_id}:#{window_name}",
+            "#{session_name}:#{window_id}:#{pane_pid}:#{window_name}",
         ],
         capture_output=True,
         text=True,
     )
     raw_output = result.stdout.strip()
-    # Expected format: "session_name:@id:window_name"
-    parts = raw_output.split(":", 2)
-    if len(parts) < 3:
+    # Expected format: "session_name:@id:pane_pid:window_name"
+    parts = raw_output.split(":", 3)
+    if len(parts) < 4 or not parts[2].isdigit():
         logger.warning(
-            "Failed to parse session:window_id:window_name from tmux (pane=%s, output=%s)",
+            "Failed to parse session:window_id:pane_pid:window_name from tmux (pane=%s, output=%s)",
             pane_id,
             raw_output,
         )
         return
-    tmux_session_name, window_id, window_name = parts
+    tmux_session_name, window_id, pane_pid, window_name = parts
+
+    if _is_nested_claude(os.getppid(), int(pane_pid), _process_table()):
+        logger.info(
+            "Session %s started inside another Claude in %s:%s, not mapping it",
+            session_id,
+            tmux_session_name,
+            window_id,
+        )
+        return
     # Key uses window_id for uniqueness
     session_window_key = f"{tmux_session_name}:{window_id}"
 

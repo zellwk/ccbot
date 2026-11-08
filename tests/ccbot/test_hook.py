@@ -6,7 +6,7 @@ import sys
 
 import pytest
 
-from ccbot.hook import _UUID_RE, _is_hook_installed, hook_main
+from ccbot.hook import _UUID_RE, _is_hook_installed, _is_nested_claude, hook_main
 
 
 class TestUuidRegex:
@@ -81,6 +81,31 @@ class TestIsHookInstalled:
             }
         }
         assert _is_hook_installed(settings) is True
+
+
+# pid: (ppid, comm). 100 is the pane's Claude; the hook runs under sh.
+_PANE_CLAUDE = {100: (1, "claude"), 200: (100, "/bin/sh")}
+
+
+class TestIsNestedClaude:
+    def test_pane_claude_is_not_nested(self) -> None:
+        assert _is_nested_claude(200, 100, _PANE_CLAUDE) is False
+
+    def test_claude_started_from_a_shell_pane_is_not_nested(self) -> None:
+        table = {90: (1, "-zsh"), 100: (90, "claude"), 200: (100, "/bin/sh")}
+        assert _is_nested_claude(200, 90, table) is False
+
+    def test_claude_run_from_a_bash_tool_is_nested(self) -> None:
+        table = {
+            **_PANE_CLAUDE,
+            300: (100, "/bin/zsh"),
+            400: (300, "/Users/x/.local/bin/claude"),
+            500: (400, "/bin/sh"),
+        }
+        assert _is_nested_claude(500, 100, table) is True
+
+    def test_unknown_parent_stops_the_walk(self) -> None:
+        assert _is_nested_claude(200, 100, {200: (999, "claude")}) is False
 
 
 class TestHookMainValidation:
