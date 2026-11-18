@@ -120,6 +120,11 @@ def env(monkeypatch, tmp_path):
 async def run(bot, job) -> None:
     """Runs one job and every chain it starts, to the end."""
     await scheduler._open_session_for_job(bot, job)
+    await run_pending()
+
+
+async def run_pending() -> None:
+    """Runs every chain task already started, to the end."""
     while pending := [
         t for t in asyncio.all_tasks() if t is not asyncio.current_task()
     ]:
@@ -207,6 +212,24 @@ class TestChain:
         env.reports["fake-triage"] = None
         await run(env.bot, TRIAGE)
         assert env.worked == ["fake-triage"]
+
+    async def test_signal_job_waits_for_its_signal(self, env) -> None:
+        triage = {**TRIAGE, "next_on": "signal"}
+        (env.dir / "jobs.json").write_text(json.dumps([triage, SUPPORT, ACTION]))
+
+        await run(env.bot, triage)
+        assert env.worked == ["fake-triage"]
+
+        scheduler.request_chain("fake-triage")
+        scheduler._start_requested_chains(env.bot)
+        await run_pending()
+
+        assert env.worked == ["fake-triage", "fake-support", "fake-action"]
+        assert list((env.dir / "chain-requests").iterdir()) == []
+
+    def test_signal_for_a_job_without_followers_is_refused(self, env) -> None:
+        with pytest.raises(ValueError):
+            scheduler.request_chain("fake-support")
 
     async def test_ending_the_triage_session_starts_no_follower(self, env) -> None:
         """Closing a topic, /done and a reap all end a session through here."""

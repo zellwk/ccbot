@@ -18,10 +18,24 @@ def main() -> None:
 
             hook_main()
             return
+        if sys.argv[1] == "chain" and len(sys.argv) == 3:
+            from .scheduler import request_chain
+
+            try:
+                request_chain(sys.argv[2])
+            except ValueError as e:
+                print(f"Error: {e}", file=sys.stderr)
+                sys.exit(1)
+            print(f"Requested: {sys.argv[2]}'s next jobs start within a minute.")
+            return
         # Reject anything else: silently falling through to "start the bot"
         # means a typo (or `ccbot --help`) launches a second bot instance
         # that races the real one for Telegram updates.
-        usage = "Usage: ccbot        start the Telegram bot\n       ccbot hook   run as Claude Code SessionStart hook"
+        usage = (
+            "Usage: ccbot              start the Telegram bot\n"
+            "       ccbot hook         run as Claude Code SessionStart hook\n"
+            "       ccbot chain <job>  start <job>'s next jobs (for jobs with next_on: signal)"
+        )
         if sys.argv[1] in ("-h", "--help"):
             print(usage)
             return
