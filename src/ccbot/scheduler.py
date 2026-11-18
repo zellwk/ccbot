@@ -47,16 +47,14 @@ Job shape::
 — ``headless`` on the Mac mini, ``main`` on the laptop. Omit it to run everywhere.
 
 ``next`` names a job, or a list of jobs, to start once this job's report has been
-posted. Closing a topic, ``/done``, a reap or a killed window never starts a
-follower, so tidying old topics sets nothing off. A list runs its followers one
-after another, each in its own topic.
+posted. A list runs its followers one after another, each in its own topic.
 
-``"next_on": "signal"`` holds the followers back from the report, for a job whose
-real work waits on Zell — triage reports, then applies labels only once he
-approves, and support and action read those labels. The job's session sends the
-signal itself when that work is done, with ``ccbot chain <job>``. The command
-drops a file in ``~/.ccbot/chain-requests/``, and the next tick starts the job's
-followers.
+``"next_on": "close"`` moves the trigger to Zell closing the job's topic, or
+running ``/done`` in it. It suits a job whose real work waits on him: triage
+reports, then applies labels only once he approves, and support and action read
+those labels. Closing any other topic, a reap, a killed window, or the next run
+replacing the session never starts a follower, so tidying old topics sets
+nothing off.
 Each follower needs no ``at`` and should carry ``"enabled": false`` so the clock
 never starts it on its own — chaining calls it directly. Chains can run any
 depth: triage → support → action.
@@ -137,7 +135,6 @@ async def scheduled_jobs_loop(bot: Bot) -> None:
     while True:
         await asyncio.sleep(TICK_SECONDS)
         try:
-            _start_requested_chains(bot)
             fired = _load_fired_dates()
             now = datetime.now()
             for job in _due_jobs(_load_jobs(), now, fired):
@@ -238,7 +235,7 @@ async def _open_session_for_job(bot: Bot, job: dict[str, Any]) -> None:
         await _post_report(bot, chat_id, thread_id, report)
 
     # The report has landed, so this run is done as far as its followers care,
-    # unless they wait for the job's signal. A task of their own, because each
+    # unless they wait for the topic to close. A task of their own, because each
     # works headless for minutes and the clock must keep ticking meanwhile.
     chains_on_report = job.get("next_on", "report") == "report"
     if not report.failed and job.get("next") and chains_on_report:
@@ -399,33 +396,21 @@ async def _start_followers(bot: Bot, job: dict[str, Any]) -> None:
         logger.exception("Job %s: chaining failed", job["name"])
 
 
-def request_chain(name: str) -> None:
-    """Asks the running bot to start ``name``'s followers on its next tick.
+def chain_on_close(bot: Bot, thread_id: int) -> None:
+    """Starts the followers of each job that chains on its topic closing.
 
-    Raises ValueError when no job by that name has followers, so the session
-    sending the signal sees the mistake instead of waiting on a chain that never comes.
+    Called when Zell closes a topic or runs /done in it. Must run before the
+    closed topic is forgotten, since the topic's name is what finds the job.
     """
-    job = next((j for j in _load_jobs() if j["name"] == name), None)
-    if not job or not job.get("next"):
-        raise ValueError(f"no job named {name!r} with a 'next' in jobs.json")
-    _chain_requests_dir().mkdir(exist_ok=True)
-    (_chain_requests_dir() / name).touch()
-
-
-def _start_requested_chains(bot: Bot) -> None:
-    """Starts the followers of each job whose session has sent its signal."""
-    requests_dir = _chain_requests_dir()
-    if not requests_dir.exists():
+    topic = next(
+        (name for name, tid in _job_topics().items() if tid == thread_id), None
+    )
+    if topic is None:
         return
-    jobs = _load_jobs()
-    for request in requests_dir.iterdir():
-        request.unlink()
-        job = next((j for j in jobs if j["name"] == request.name), None)
-        if not job:
-            logger.error("Chain request for unknown job %r", request.name)
-            continue
-        logger.info("Job %s: signalled, starting its followers", job["name"])
-        asyncio.create_task(_start_followers(bot, job))
+    for job in _load_jobs():
+        if job["topic"] == topic and job.get("next") and job.get("next_on") == "close":
+            logger.info("Job %s: topic closed, starting its followers", job["name"])
+            asyncio.create_task(_start_followers(bot, job))
 
 
 def _claim_today(name: str) -> bool:
@@ -469,10 +454,6 @@ def _remember_job_topic(name: str, thread_id: int) -> None:
 
 def _job_topics_path() -> Path:
     return ccbot_dir() / "jobs-topics.json"
-
-
-def _chain_requests_dir() -> Path:
-    return ccbot_dir() / "chain-requests"
 
 
 def _fired_path() -> Path:

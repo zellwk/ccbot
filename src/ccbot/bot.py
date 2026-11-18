@@ -139,7 +139,7 @@ from .markdown_v2 import convert_markdown
 from .handlers.response_builder import build_response_parts
 from .handlers.reap import reap_loop
 from .handlers.status_polling import status_poll_loop
-from .scheduler import forget_closed_topic, scheduled_jobs_loop
+from .scheduler import chain_on_close, forget_closed_topic, scheduled_jobs_loop
 from .screenshot import text_to_image
 from .session import session_manager
 from .token_usage import read_usage
@@ -406,9 +406,9 @@ async def done_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     """LOCAL PATCH: end this topic's session and clear the topic away.
 
     Closing a topic ends the session it held. /done does that and deletes the
-    topic too, so a finished thread doesn't have to be tidied up by hand. It
-    never starts a chained job — only a job's delivered report does that.
-    Works in any topic. A job's next run makes its topic again.
+    topic too, so a finished thread doesn't have to be tidied up by hand. Like a
+    close, it starts the followers of a job that chains on close. Works in any
+    topic. A job's next run makes its topic again.
     """
     user = update.effective_user
     if not user or not is_user_allowed(user.id):
@@ -424,6 +424,7 @@ async def done_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     # Read before ending the session, while the thread still resolves.
     chat_id = session_manager.resolve_chat_id(user.id, thread_id)
     await end_session(context.bot, thread_id, context.user_data)
+    chain_on_close(context.bot, thread_id)
 
     try:
         await context.bot.delete_forum_topic(
@@ -644,13 +645,15 @@ async def topic_closed_handler(
 ) -> None:
     """Handle topic closure — end the session the topic was holding.
 
-    Never starts a chained job, so closing old topics in bulk sets nothing off.
-    A job's closed topic is done with, so its next run makes a new one.
+    Starts chained jobs only for a job that chains on close, so closing old
+    topics in bulk sets nothing off. A job's closed topic is done with, so its
+    next run makes a new one.
     """
     thread_id = _get_thread_id(update)
     if thread_id is None:
         return
     await end_session(context.bot, thread_id, context.user_data)
+    chain_on_close(context.bot, thread_id)
     forget_closed_topic(thread_id)
 
 
