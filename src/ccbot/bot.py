@@ -14,8 +14,9 @@ Core responsibilities:
     (_open_topic_for_main_chat).
   - Photo handling: photos sent by user are downloaded and forwarded
     to Claude Code as file paths (photo_handler).
-  - Voice handling: voice messages are transcribed via OpenAI API and
-    forwarded as text (voice_handler).
+  - Voice handling: voice messages are transcribed (locally, or via OpenAI
+    when a key is set) and forwarded as text. A failed transcription
+    forwards the saved voice file's path instead (voice_handler).
   - Automatic cleanup: closing a topic kills the associated window
     (topic_closed_handler). Unsupported content (stickers, etc.)
     is rejected with a warning (unsupported_content_handler).
@@ -983,7 +984,11 @@ async def media_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 async def voice_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle voice messages: transcribe via OpenAI and forward text to Claude Code."""
+    """Handle voice messages: transcribe and forward the text to Claude Code.
+
+    When transcription fails, the voice file is saved to the media directory
+    and Claude Code gets its path, so the session can transcribe it instead.
+    """
     user = update.effective_user
     if not user or not is_user_allowed(user.id):
         if update.message:
@@ -991,14 +996,6 @@ async def voice_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
 
     if not update.message or not update.message.voice:
-        return
-
-    if not config.openai_api_key:
-        await safe_reply(
-            update.message,
-            "⚠ Voice transcription requires an OpenAI API key.\n"
-            "Set `OPENAI_API_KEY` in your `.env` file and restart the bot.",
-        )
         return
 
     chat = update.message.chat
@@ -1019,19 +1016,23 @@ async def voice_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         session_manager.set_group_chat_id(user.id, thread_id, chat.id)
 
     # Download voice as in-memory bytes
-    voice_file = await update.message.voice.get_file()
+    voice = update.message.voice
+    voice_file = await voice.get_file()
     ogg_data = bytes(await voice_file.download_as_bytearray())
 
-    # Transcribe
+    # Transcribes, or saves the voice file for Claude to transcribe
     try:
         text = await transcribe_voice(ogg_data)
-    except ValueError as e:
-        await safe_reply(reply_to, f"⚠ {e}")
-        return
+        confirmation = f'🎤 "{text}"'
     except Exception as e:
         logger.error("Voice transcription failed: %s", e)
-        await safe_reply(reply_to, f"⚠ Transcription failed: {e}")
-        return
+        suffix = Path(voice_file.file_path or "").suffix or ".oga"
+        file_path = _MEDIA_DIR / f"{int(time.time())}_{voice.file_unique_id}{suffix}"
+        file_path.write_bytes(ogg_data)
+        text = f"(voice attached: {file_path} — transcription failed, transcribe it yourself)"
+        confirmation = (
+            "⚠ Couldn't transcribe this voice note. Sent the file to Claude instead."
+        )
 
     wid = await _resolve_window_for_thread(context, user, thread_id, text, reply_to)
     if wid is None:
@@ -1059,7 +1060,7 @@ async def voice_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await safe_reply(reply_to, f"❌ {message}")
         return
 
-    await safe_reply(reply_to, f'🎤 "{text}"')
+    await safe_reply(reply_to, confirmation)
 
 
 # Active bash capture tasks: (user_id, thread_id) → asyncio.Task
@@ -2310,7 +2311,7 @@ def create_bot() -> Application:
     )
     # Photos: download and forward file path to Claude Code
     application.add_handler(MessageHandler(filters.PHOTO, photo_handler))
-    # Voice: transcribe via OpenAI and forward text to Claude Code
+    # Voice: transcribe and forward text to Claude Code
     application.add_handler(MessageHandler(filters.VOICE, voice_handler))
     # LOCAL PATCH: video, audio and documents — save and forward the file path
     application.add_handler(

@@ -26,7 +26,7 @@ In fact, CCBot itself was built this way — iterating on itself through Claude 
 - **Topic-based sessions** — Each Telegram topic maps 1:1 to a tmux window and Claude session
 - **Real-time notifications** — Get Telegram messages for assistant responses, thinking content, tool use/result, and local command output
 - **Interactive UI** — Navigate AskUserQuestion, ExitPlanMode, and Permission Prompts via inline keyboard
-- **Voice messages** — Voice messages are transcribed via OpenAI and forwarded as text
+- **Voice messages** — Voice messages are transcribed locally with `parakeet-mlx` (or via OpenAI when `OPENAI_API_KEY` is set) and forwarded as text. When transcription fails, Claude gets the saved voice file's path instead
 - **Send messages** — Forward text to Claude Code via tmux keystrokes
 - **Slash command forwarding** — Send any `/command` directly to Claude Code (e.g. `/clear`, `/compact`, `/cost`)
 - **Create new sessions** — Start Claude Code sessions from Telegram via directory browser
@@ -95,7 +95,7 @@ ALLOWED_USERS=your_telegram_user_id
 | `CLAUDE_COMMAND`        | `claude`   | Command to run in new windows                    |
 | `MONITOR_POLL_INTERVAL` | `2.0`      | Polling interval in seconds                      |
 | `CCBOT_SHOW_HIDDEN_DIRS` | `false` | Show hidden (dot) directories in directory browser |
-| `OPENAI_API_KEY` | _(none)_ | OpenAI API key for voice message transcription |
+| `OPENAI_API_KEY` | _(none)_ | Transcribes voice through OpenAI instead of local `parakeet-mlx` |
 | `OPENAI_BASE_URL` | `https://api.openai.com/v1` | OpenAI API base URL (for proxies or compatible APIs) |
 
 Message formatting is always HTML via `chatgpt-md-converter` (`chatgpt_md_converter` package).
@@ -261,7 +261,7 @@ src/ccbot/
 ├── terminal_parser.py     # Terminal pane parsing (interactive UI + status line)
 ├── html_converter.py      # Markdown → Telegram HTML conversion + HTML-aware splitting
 ├── screenshot.py          # Terminal text → PNG image with ANSI color support
-├── transcribe.py          # Voice-to-text transcription via OpenAI API
+├── transcribe.py          # Voice-to-text transcription, local parakeet-mlx or OpenAI
 ├── utils.py               # Shared utilities (atomic JSON writes, JSONL helpers)
 ├── tmux_manager.py        # Tmux window management (list, create, send keys, kill)
 ├── fonts/                 # Bundled fonts for screenshot rendering

@@ -18,11 +18,24 @@ PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 SUPERVISE="$HOME/projects/@zellwk/ai-init/context/claude/channels/telegram/ccbot-supervise.sh"
 HOST_SESSION="ccbot-host"
 TOOL_PYTHON="$HOME/.local/share/uv/tools/ccbot/bin/python"
+CCBOT_DIR_MAIN="$HOME/.ccbot"
 MAX_WAIT=10  # seconds to wait for a process to exit
 
 # Patterns are anchored to the start of the command line so a shell that merely
 # mentions a path (a grep, an ssh one-liner) cannot masquerade as a running bot.
-supervised_pids() { pgrep -f "^$TOOL_PYTHON" 2>/dev/null || true; }
+#
+# The tax bridge runs the same python, so the main bridge is picked out by the
+# CCBOT_DIR in its environment. An unset CCBOT_DIR counts as the main bridge,
+# the same rule ccbot-supervise.sh uses.
+supervised_pids() {
+    local pid env_dir
+    for pid in $(pgrep -f "^$TOOL_PYTHON" 2>/dev/null || true); do
+        env_dir="$(ps eww -o command= -p "$pid" 2>/dev/null | tr ' ' '\n' | grep -m1 '^CCBOT_DIR=' | cut -d= -f2- || true)"
+        if [ -z "$env_dir" ] || [ "$env_dir" = "$CCBOT_DIR_MAIN" ]; then
+            echo "$pid"
+        fi
+    done
+}
 stray_pids() { pgrep -f "^uv run ccbot|^$PROJECT_DIR/.venv/bin/python" 2>/dev/null || true; }
 
 # A copy started from the project venv is never the supervised one — it is the

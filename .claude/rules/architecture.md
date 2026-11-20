@@ -69,7 +69,7 @@
 
 Additional modules:
   screenshot.py       ─ Terminal text → PNG rendering (ANSI color, font fallback)
-  transcribe.py       ─ Voice-to-text transcription via OpenAI API (gpt-4o-transcribe)
+  transcribe.py       ─ Voice-to-text transcription, local parakeet-mlx or OpenAI gpt-4o-transcribe
   main.py             ─ CLI entry point
   utils.py            ─ Shared utilities (ccbot_dir, atomic_write_json)
 

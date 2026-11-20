@@ -1,5 +1,8 @@
-"""Unit tests for transcribe — voice-to-text via OpenAI API."""
+"""Unit tests for transcribe — voice-to-text via local parakeet-mlx or OpenAI."""
 
+import os
+import tempfile
+from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import httpx
@@ -32,7 +35,7 @@ def _mock_response(*, json_data: dict, status_code: int = 200) -> httpx.Response
     return resp
 
 
-class TestTranscribeVoice:
+class TestTranscribeWithOpenAI:
     @pytest.mark.asyncio
     async def test_success(self, mock_config):
         resp = _mock_response(json_data={"text": "Hello world"})
@@ -106,6 +109,103 @@ class TestTranscribeVoice:
 
         url_arg = mock_post.call_args[0][0]
         assert url_arg == "https://proxy.example.com/v1/audio/transcriptions"
+
+
+@pytest.fixture
+def local_config():
+    """Patch config with no OpenAI key, so transcription runs locally."""
+    with patch.object(transcribe, "config") as cfg:
+        cfg.openai_api_key = ""
+        yield cfg
+
+
+@pytest.fixture
+def fake_parakeet(tmp_path, monkeypatch):
+    """Point PARAKEET_BIN at a shell script that stands in for parakeet-mlx.
+
+    The script gets parakeet's argv, so "$6" is the output dir. The test
+    supplies the script body.
+    """
+
+    def _install(body: str) -> None:
+        script = tmp_path / "parakeet-mlx"
+        script.write_text(f"#!/bin/sh\n{body}\n")
+        script.chmod(0o755)
+        monkeypatch.setattr(transcribe, "PARAKEET_BIN", script)
+
+    return _install
+
+
+class TestTranscribeLocally:
+    @pytest.mark.asyncio
+    async def test_returns_transcript_parakeet_writes(
+        self, local_config, fake_parakeet
+    ):
+        fake_parakeet('printf "  Hello from parakeet\\n" > "$6/voice.txt"')
+
+        result = await transcribe.transcribe_voice(b"fake-ogg-data")
+
+        assert result == "Hello from parakeet"
+
+    @pytest.mark.asyncio
+    async def test_passes_audio_bytes_to_parakeet(self, local_config, fake_parakeet):
+        fake_parakeet('cp "$7" "$6/voice.txt"')
+
+        result = await transcribe.transcribe_voice(b"the-ogg-bytes")
+
+        assert result == "the-ogg-bytes"
+
+    @pytest.mark.asyncio
+    async def test_puts_homebrew_on_path_for_ffmpeg(
+        self, local_config, fake_parakeet, monkeypatch
+    ):
+        monkeypatch.setenv("PATH", "/usr/bin:/bin")
+        fake_parakeet('printf "%s" "$PATH" > "$6/voice.txt"')
+
+        result = await transcribe.transcribe_voice(b"fake-ogg-data")
+
+        assert result.split(":")[0] == "/opt/homebrew/bin"
+
+    @pytest.mark.asyncio
+    async def test_missing_transcript_raises_with_output(
+        self, local_config, fake_parakeet
+    ):
+        # parakeet-mlx prints its error and still exits 0
+        fake_parakeet('echo "Error transcribing file: FFmpeg is not installed"')
+
+        with pytest.raises(RuntimeError, match="FFmpeg is not installed"):
+            await transcribe.transcribe_voice(b"fake-ogg-data")
+
+    @pytest.mark.asyncio
+    async def test_empty_transcript_raises(self, local_config, fake_parakeet):
+        fake_parakeet('printf "  \\n" > "$6/voice.txt"')
+
+        with pytest.raises(ValueError, match="Empty transcription"):
+            await transcribe.transcribe_voice(b"fake-ogg-data")
+
+    @pytest.mark.asyncio
+    async def test_removes_temp_dir(self, local_config, fake_parakeet):
+        fake_parakeet('printf "done" > "$6/voice.txt"')
+        temp_root = Path(tempfile.gettempdir())
+        before = set(temp_root.glob("ccbot-voice-*"))
+
+        await transcribe.transcribe_voice(b"fake-ogg-data")
+
+        assert set(temp_root.glob("ccbot-voice-*")) == before
+
+    @pytest.mark.asyncio
+    async def test_hung_parakeet_is_killed_and_raises(
+        self, local_config, fake_parakeet, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr(transcribe, "PARAKEET_TIMEOUT_SECONDS", 0.5)
+        pid_file = tmp_path / "pid"
+        fake_parakeet(f'echo $$ > "{pid_file}"; exec sleep 5')
+
+        with pytest.raises(RuntimeError, match="no transcript within"):
+            await transcribe.transcribe_voice(b"fake-ogg-data")
+
+        with pytest.raises(ProcessLookupError):
+            os.kill(int(pid_file.read_text()), 0)
 
 
 class TestCloseClient:

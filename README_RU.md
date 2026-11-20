@@ -24,7 +24,7 @@ CCBot позволяет **бесшовно продолжать ту же са�
 - **Сессии по темам** — каждый Telegram topic 1:1 связан с tmux-окном и Claude-сессией
 - **Уведомления в реальном времени** — ответы ассистента, thinking-контент, tool use/result, вывод локальных команд
 - **Интерактивный UI** — управление AskUserQuestion, ExitPlanMode и Permission Prompt через inline-клавиатуру
-- **Голосовые сообщения** — голосовые сообщения транскрибируются через OpenAI и пересылаются как текст
+- **Голосовые сообщения** — голосовые сообщения транскрибируются локально через `parakeet-mlx` (или через OpenAI, если задан `OPENAI_API_KEY`) и пересылаются как текст. Если транскрипция не удалась, Claude получает путь к сохранённому голосовому файлу
 - **Отправка сообщений** — проброс текста в Claude Code через tmux
 - **Проброс slash-команд** — любая `/command` уходит напрямую в Claude Code (например, `/clear`, `/compact`, `/cost`)
 - **Создание новых сессий** — запуск Claude Code из Telegram через браузер директорий
@@ -93,7 +93,7 @@ ALLOWED_USERS=your_telegram_user_id
 | `CLAUDE_COMMAND` | `claude` | Команда запуска в новых окнах |
 | `MONITOR_POLL_INTERVAL` | `2.0` | Интервал опроса в секундах |
 | `CCBOT_SHOW_HIDDEN_DIRS` | `false` | Показывать скрытые (dot) директории в браузере каталогов |
-| `OPENAI_API_KEY` | _(нет)_ | API-ключ OpenAI для транскрипции голосовых сообщений |
+| `OPENAI_API_KEY` | _(нет)_ | Транскрибирует голос через OpenAI вместо локального `parakeet-mlx` |
 | `OPENAI_BASE_URL` | `https://api.openai.com/v1` | Базовый URL OpenAI API (для прокси или совместимых API) |
 
 Форматирование сообщений всегда HTML через `chatgpt-md-converter` (`chatgpt_md_converter`).
@@ -270,7 +270,7 @@ src/ccbot/
 ├── terminal_parser.py     # Парсинг terminal pane (interactive UI + status line)
 ├── html_converter.py      # Markdown -> Telegram HTML + HTML-aware splitting
 ├── screenshot.py          # Terminal text -> PNG с поддержкой ANSI-цветов
-├── transcribe.py          # Транскрипция голоса в текст через OpenAI API
+├── transcribe.py          # Транскрипция голоса в текст, локально parakeet-mlx или OpenAI
 ├── utils.py               # Общие утилиты (atomic JSON writes, JSONL helpers)
 ├── tmux_manager.py        # Управление tmux-окнами (list, create, send keys, kill)
 ├── fonts/                 # Встроенные шрифты для рендера скриншотов

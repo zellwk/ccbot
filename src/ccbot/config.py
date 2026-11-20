@@ -140,7 +140,7 @@ class Config:
             if name.strip()
         }
 
-        # OpenAI API for voice message transcription (optional)
+        # OpenAI API for voice transcription. Unset means local parakeet-mlx.
         self.openai_api_key: str = os.getenv("OPENAI_API_KEY", "")
         self.openai_base_url: str = os.getenv(
             "OPENAI_BASE_URL", "https://api.openai.com/v1"
